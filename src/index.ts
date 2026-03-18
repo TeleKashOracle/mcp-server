@@ -332,6 +332,36 @@ Example: If Kalshi prices "BTC $200K" at 35% and Polymarket at 28%, that's a 7% 
       required: [],
     },
   },
+  {
+    name: "get_signal",
+    description: `Get a structured pre-computed trading signal for any prediction market — TeleKash Probability Format (TPF).
+
+Combines probability, confidence, sentiment, noise filter, and cross-source data into one actionable signal. This is the complete intelligence package for autonomous agents.
+
+Returns:
+- probability with confidence grade (HIGH/MEDIUM/LOW/VERY_LOW)
+- sentiment score with recommendation (bullish/bearish/neutral)
+- noise filter (signal/weak/noise) — is this momentum real or random walk?
+- cross-source spread (if market exists on multiple exchanges)
+- actionable verdict: STRONG_BUY / BUY / HOLD / SELL / STRONG_SELL / NO_SIGNAL
+
+Use this as the single entry point when an agent needs to make a trade decision. One call replaces get_probability + get_sentiment + get_history + compare_sources.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        market_id: {
+          type: "string",
+          description: "The market UUID or external_id (ticker)",
+        },
+        query: {
+          type: "string",
+          description:
+            "Natural language query to find the market (alternative to market_id)",
+        },
+      },
+      required: [],
+    },
+  },
   // ===========================================
   // AGENT TRADING TOOLS — Coming soon (pool infrastructure built, awaiting liquidity)
   // Uncomment when agent pools are funded and active
@@ -412,6 +442,51 @@ function computeConfidence(market: {
     },
     warning,
   };
+}
+
+// Verdict reasoning — human-readable explanation of the TPF verdict
+function buildVerdictReasoning(
+  verdict: string,
+  confidenceGrade: string,
+  signalQuality: string,
+  sentiment: string,
+  crossSource: Record<string, unknown> | null,
+  momentum: number,
+): string {
+  const parts: string[] = [];
+
+  if (verdict === "NO_SIGNAL") {
+    return "Insufficient data to generate a reliable signal. Low confidence and no momentum history.";
+  }
+
+  // Sentiment direction
+  if (sentiment === "bullish") parts.push("Market sentiment is bullish");
+  else if (sentiment === "bearish") parts.push("Market sentiment is bearish");
+  else parts.push("Market sentiment is neutral");
+
+  // Confidence qualifier
+  if (confidenceGrade === "HIGH")
+    parts.push("with high confidence (strong volume + liquidity)");
+  else if (confidenceGrade === "MEDIUM") parts.push("with moderate confidence");
+  else parts.push("but confidence is low (thin market)");
+
+  // Momentum
+  if (signalQuality === "signal" && Math.abs(momentum) > 0.01) {
+    parts.push(
+      `Sustained ${momentum > 0 ? "upward" : "downward"} momentum (${Math.round(momentum * 100)}% in 24h)`,
+    );
+  } else if (signalQuality === "noise") {
+    parts.push("24h momentum appears to be noise (high reversal rate)");
+  }
+
+  // Cross-source
+  if (crossSource && (crossSource.spread_pct as number) >= 5) {
+    parts.push(
+      `Cross-source spread of ${crossSource.spread_pct}% detected — potential arbitrage`,
+    );
+  }
+
+  return parts.join(". ") + ".";
 }
 
 // Server class
@@ -502,6 +577,10 @@ class TeleKashMCPServer {
                 category?: string;
                 limit?: number;
               },
+            );
+          case "get_signal":
+            return await this.getSignal(
+              args as { market_id?: string; query?: string },
             );
           // Agent Trading Tools — gated until pools are funded
           // case "get_pool_status":
@@ -1895,6 +1974,353 @@ class TeleKashMCPServer {
             null,
             2,
           ),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // STRUCTURED SIGNAL — TeleKash Probability Format (TPF)
+  // ===========================================
+
+  private async getSignal(args: {
+    market_id?: string;
+    query?: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const { market_id, query } = args;
+
+    if (!market_id && !query) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Please provide either a market_id or a search query.",
+          },
+        ],
+      };
+    }
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "No database connection",
+                _note:
+                  "Connect to TeleKash for live signals. Set SUPABASE_URL and SUPABASE_ANON_KEY.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Find market (same pattern as getProbability)
+    let market: Record<string, unknown> | null = null;
+
+    if (market_id) {
+      const { data } = await this.supabase
+        .from("telekash_markets")
+        .select("*")
+        .or(`id.eq.${market_id},external_id.eq.${market_id}`)
+        .single();
+      market = data;
+    } else if (query) {
+      const { data } = await this.supabase
+        .from("telekash_markets")
+        .select("*")
+        .eq("status", "active")
+        .ilike("title", `%${query}%`)
+        .order("raw_data->volume", { ascending: false })
+        .limit(1)
+        .single();
+      market = data;
+    }
+
+    if (!market) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Market not found", market_id, query },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // === 1. PROBABILITY + CONFIDENCE ===
+    const yesProb =
+      (market.external_odds as Record<string, number>)?.yes || 0.5;
+    const noProb = (market.external_odds as Record<string, number>)?.no || 0.5;
+    const rawData = (market.raw_data as Record<string, unknown>) || {};
+    const volume =
+      (rawData.volume_24h as number) || (rawData.volume as number) || 0;
+    const liquidity = (rawData.liquidity as number) || 0;
+
+    const confidence = computeConfidence({
+      volume,
+      liquidity,
+      yesProbability: Math.round(yesProb * 100),
+      closesAt: market.closes_at as string,
+    });
+
+    // === 2. MOMENTUM + NOISE FILTER ===
+    const now = Date.now();
+    const startTime24h = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+    const { data: historyData } = await this.supabase
+      .from("telekash_probability_history")
+      .select("probability, recorded_at")
+      .eq("market_id", market.id)
+      .gte("recorded_at", startTime24h)
+      .order("recorded_at", { ascending: true });
+
+    let momentum = 0;
+    let signalQuality = "insufficient_data";
+    let reversals = 0;
+    let signalRatio = 0;
+    let dataPoints = 0;
+
+    if (historyData && historyData.length >= 2) {
+      const probs = historyData.map(
+        (h: Record<string, unknown>) => h.probability as number,
+      );
+      dataPoints = probs.length;
+      momentum = probs[probs.length - 1] - probs[0];
+
+      let sustainedMoves = 0;
+      for (let i = 2; i < probs.length; i++) {
+        const prevDir = probs[i - 1] - probs[i - 2];
+        const currDir = probs[i] - probs[i - 1];
+        if (prevDir * currDir < 0) reversals++;
+        else if (Math.abs(currDir) > 0.001) sustainedMoves++;
+      }
+      const totalMoves = Math.max(1, reversals + sustainedMoves);
+      signalRatio = sustainedMoves / totalMoves;
+      signalQuality =
+        probs.length < 3
+          ? "insufficient_data"
+          : signalRatio >= 0.6
+            ? "signal"
+            : signalRatio >= 0.4
+              ? "weak"
+              : "noise";
+    }
+
+    // === 3. SENTIMENT ===
+    const closesAt = new Date(market.closes_at as string).getTime();
+    const daysToClose = Math.max(0, (closesAt - now) / (1000 * 60 * 60 * 24));
+
+    const probabilityConviction = Math.abs(yesProb - 0.5) * 2;
+    const volumeSignal = Math.min(1, Math.log10(Math.max(1, volume)) / 7);
+    const recencyScore =
+      daysToClose <= 1
+        ? 1.0
+        : daysToClose <= 7
+          ? 0.8
+          : daysToClose <= 30
+            ? 0.5
+            : 0.3;
+    const momentumScore = Math.min(1, Math.abs(momentum) * 5);
+
+    const sentimentScore = (yesProb - 0.5) * 2; // -1 to 1
+    const sentimentConfidence =
+      probabilityConviction * 0.3 +
+      volumeSignal * 0.3 +
+      recencyScore * 0.2 +
+      momentumScore * 0.2;
+
+    let recommendation: string;
+    if (sentimentScore > 0.3 && sentimentConfidence > 0.4)
+      recommendation = "bullish";
+    else if (sentimentScore < -0.3 && sentimentConfidence > 0.4)
+      recommendation = "bearish";
+    else recommendation = "neutral";
+
+    // === 4. CROSS-SOURCE SPREAD ===
+    let crossSource: Record<string, unknown> | null = null;
+    const titleWords = (market.title as string)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .split(/\s+/)
+      .filter((w: string) => w.length > 3);
+
+    if (titleWords.length >= 2) {
+      // Find matching market on different source
+      const otherSource =
+        (market.source as string) === "kalshi" ? "polymarket" : "kalshi";
+      const searchPattern = `%${titleWords.slice(0, 3).join("%")}%`;
+
+      const { data: matches } = await this.supabase
+        .from("telekash_markets")
+        .select("id, title, source, external_odds")
+        .eq("source", otherSource)
+        .eq("status", "active")
+        .ilike("title", searchPattern)
+        .limit(3);
+
+      if (matches && matches.length > 0) {
+        // Pick best match by word overlap
+        let bestMatch: Record<string, unknown> | null = null;
+        let bestOverlap = 0;
+
+        for (const m of matches as Record<string, unknown>[]) {
+          const mWords = (m.title as string)
+            .toLowerCase()
+            .replace(/[^a-z0-9\s]/g, "")
+            .split(/\s+/)
+            .filter((w: string) => w.length > 3);
+          const overlap = titleWords.filter((w: string) =>
+            mWords.includes(w),
+          ).length;
+          if (overlap > bestOverlap) {
+            bestOverlap = overlap;
+            bestMatch = m;
+          }
+        }
+
+        if (bestMatch && bestOverlap >= 2) {
+          const otherYes =
+            (bestMatch.external_odds as Record<string, number>)?.yes || 0.5;
+          const spread = Math.abs(yesProb - otherYes);
+
+          crossSource = {
+            other_source: otherSource,
+            other_market_id: bestMatch.id,
+            other_title: bestMatch.title,
+            other_yes_probability: Math.round(otherYes * 100),
+            spread_pct: parseFloat((spread * 100).toFixed(1)),
+            word_overlap: bestOverlap,
+            arbitrage_signal:
+              spread >= 0.05
+                ? yesProb > otherYes
+                  ? `BUY YES on ${otherSource}, SELL YES on ${market.source}`
+                  : `BUY YES on ${market.source}, SELL YES on ${otherSource}`
+                : null,
+          };
+        }
+      }
+    }
+
+    // === 5. VERDICT ===
+    // Multi-factor verdict combining all signals
+    let verdictScore = 0; // -100 to +100
+
+    // Probability direction (+/- 40 points)
+    verdictScore += sentimentScore * 40;
+
+    // Confidence weight (+/- 20 points)
+    if (confidence.grade === "HIGH")
+      verdictScore += Math.sign(sentimentScore) * 20;
+    else if (confidence.grade === "MEDIUM")
+      verdictScore += Math.sign(sentimentScore) * 10;
+    else if (confidence.grade === "VERY_LOW")
+      verdictScore -= Math.abs(sentimentScore) * 10;
+
+    // Momentum boost (+/- 20 points) — only if signal quality is good
+    if (signalQuality === "signal") {
+      verdictScore += momentum * 200; // ±0.1 momentum = ±20 points
+    } else if (signalQuality === "noise") {
+      verdictScore *= 0.7; // Dampen verdict when momentum is noise
+    }
+
+    // Cross-source arbitrage boost (+/- 20 points)
+    if (crossSource && (crossSource.spread_pct as number) >= 5) {
+      verdictScore += Math.sign(sentimentScore) * 10;
+    }
+
+    // Map to verdict
+    let verdict: string;
+    if (verdictScore > 35) verdict = "STRONG_BUY";
+    else if (verdictScore > 15) verdict = "BUY";
+    else if (verdictScore > -15) verdict = "HOLD";
+    else if (verdictScore > -35) verdict = "SELL";
+    else verdict = "STRONG_SELL";
+
+    // Override to NO_SIGNAL if data is insufficient
+    if (
+      confidence.grade === "VERY_LOW" &&
+      signalQuality === "insufficient_data"
+    ) {
+      verdict = "NO_SIGNAL";
+    }
+
+    // === BUILD TPF RESPONSE ===
+    const tpf = {
+      format: "TPF",
+      version: "1.0",
+      market: {
+        id: market.id,
+        title: market.title,
+        source: market.source,
+        category: market.category,
+        closes_at: market.closes_at,
+        days_to_close: parseFloat(daysToClose.toFixed(1)),
+      },
+      probability: {
+        yes: Math.round(yesProb * 100),
+        no: Math.round(noProb * 100),
+        confidence: {
+          score: confidence.score,
+          grade: confidence.grade,
+          factors: confidence.factors,
+          warning: confidence.warning,
+        },
+      },
+      sentiment: {
+        score: parseFloat(sentimentScore.toFixed(3)),
+        confidence: parseFloat(sentimentConfidence.toFixed(3)),
+        recommendation,
+        components: {
+          probability_conviction: parseFloat(probabilityConviction.toFixed(3)),
+          volume_signal: parseFloat(volumeSignal.toFixed(3)),
+          recency_relevance: parseFloat(recencyScore.toFixed(3)),
+          momentum_24h: parseFloat(momentumScore.toFixed(3)),
+        },
+      },
+      noise_filter: {
+        signal_quality: signalQuality,
+        signal_ratio: parseFloat(signalRatio.toFixed(3)),
+        reversals_24h: reversals,
+        data_points: dataPoints,
+        _warning:
+          signalQuality === "noise"
+            ? "Momentum is likely noise — 58% of price moves are random walk (Magician's Playbook #3)"
+            : null,
+      },
+      cross_source: crossSource,
+      verdict: {
+        action: verdict,
+        score: parseFloat(verdictScore.toFixed(1)),
+        reasoning: buildVerdictReasoning(
+          verdict,
+          confidence.grade,
+          signalQuality,
+          recommendation,
+          crossSource,
+          momentum,
+        ),
+      },
+      metadata: {
+        generated_at: new Date().toISOString(),
+        oracle: "TeleKash Probability Oracle",
+        _note:
+          "TPF (TeleKash Probability Format) — structured signal for autonomous agents. One call replaces get_probability + get_sentiment + get_history + compare_sources.",
+      },
+    };
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(tpf, null, 2),
         },
       ],
     };
