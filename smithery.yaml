@@ -1,0 +1,27 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      SUPABASE_URL:
+        type: string
+        description: "Supabase project URL for TeleKash database"
+      SUPABASE_ANON_KEY:
+        type: string
+        description: "Supabase anonymous key for read access to prediction markets"
+      TELEKASH_API_KEY:
+        type: string
+        description: "TeleKash API key for rate-limited access (optional, free tier without key)"
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', 'telekash-mcp-server'],
+      env: {
+        SUPABASE_URL: config.SUPABASE_URL || '',
+        SUPABASE_ANON_KEY: config.SUPABASE_ANON_KEY || '',
+        TELEKASH_API_KEY: config.TELEKASH_API_KEY || ''
+      }
+    })
+  exampleConfig:
+    SUPABASE_URL: "https://rrkjtdnxkscukexbsrue.supabase.co"
+    SUPABASE_ANON_KEY: "your-anon-key"
