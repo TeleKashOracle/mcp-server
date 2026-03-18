@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (12 live):
+ * Oracle Tools (13 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -20,6 +20,7 @@
  * - get_signal: Structured TPF signal (probability + confidence + sentiment + noise + verdict)
  * - track_prediction: Record a prediction for performance tracking
  * - get_performance: Agent accuracy metrics (Brier score, calibration, edge)
+ * - get_divergences: Consensus divergence detection across all sources
  *
  * @version 0.6.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
@@ -435,6 +436,40 @@ Use this to evaluate an agent's forecasting ability or track your own improvemen
       required: ["agent_id"],
     },
   },
+  {
+    name: "get_divergences",
+    description: `Find markets where prediction sources disagree — the highest-value signal in forecasting.
+
+When Kalshi, Polymarket, and Metaculus show different probabilities for the same event, at least one source is wrong. This tool finds those disagreements, ranked by spread size.
+
+Returns:
+- Markets with the largest cross-source probability gaps
+- Which source says what
+- Forecaster count from Metaculus (crowd wisdom depth)
+- Divergence classification: STRONG (>15%), MODERATE (8-15%), WEAK (3-8%)
+
+These are the markets where alpha exists. When sources converge, the edge disappears.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        min_spread: {
+          type: "number",
+          description:
+            "Minimum probability spread to include (default: 5 = 5%)",
+        },
+        category: {
+          type: "string",
+          description:
+            "Filter by category (crypto, politics, economics, sports, weather, other)",
+        },
+        limit: {
+          type: "number",
+          description: "Number of divergences to return (default: 10, max: 50)",
+        },
+      },
+      required: [],
+    },
+  },
   // ===========================================
   // AGENT TRADING TOOLS — Coming soon (pool infrastructure built, awaiting liquidity)
   // Uncomment when agent pools are funded and active
@@ -668,6 +703,14 @@ class TeleKashMCPServer {
           case "get_performance":
             return await this.getPerformance(
               args as { agent_id: string; limit?: number },
+            );
+          case "get_divergences":
+            return await this.getDivergences(
+              args as {
+                min_spread?: number;
+                category?: string;
+                limit?: number;
+              },
             );
           // Agent Trading Tools — gated until pools are funded
           // case "get_pool_status":
@@ -2408,6 +2451,209 @@ class TeleKashMCPServer {
         {
           type: "text",
           text: JSON.stringify(tpf, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // CONSENSUS DIVERGENCE DETECTION
+  // ===========================================
+
+  private async getDivergences(args: {
+    min_spread?: number;
+    category?: string;
+    limit?: number;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const { min_spread = 5, category, limit = 10 } = args;
+    const effectiveLimit = Math.min(Math.max(1, limit), 50);
+    const minSpreadDecimal = min_spread / 100;
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Get all active markets grouped by title similarity
+    // We need to find the same event across different sources
+    const sources = ["kalshi", "polymarket", "metaculus"];
+    const marketsBySource: Record<string, Record<string, unknown>[]> = {};
+
+    for (const source of sources) {
+      let query = this.supabase
+        .from("telekash_markets")
+        .select("id, title, source, external_odds, category, raw_data")
+        .eq("source", source)
+        .eq("status", "active")
+        .order("raw_data->volume", { ascending: false })
+        .limit(300);
+
+      if (category && category !== "all") {
+        query = query.eq("category", category);
+      }
+
+      const { data } = await query;
+      marketsBySource[source] = (data as Record<string, unknown>[]) || [];
+    }
+
+    // Cross-match markets between sources using word overlap
+    const divergences: Array<{
+      title: string;
+      category: string;
+      sources: Record<
+        string,
+        { market_id: string; yes_probability: number; title: string }
+      >;
+      max_spread: number;
+      classification: string;
+      forecaster_depth: number | null;
+    }> = [];
+
+    // Use Kalshi as anchor, match against Polymarket and Metaculus
+    const kalshiMarkets = marketsBySource["kalshi"] || [];
+    const polyMarkets = marketsBySource["polymarket"] || [];
+    const metaculusMarkets = marketsBySource["metaculus"] || [];
+
+    for (const kalshi of kalshiMarkets) {
+      const kTitle = (kalshi.title as string)
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, "");
+      const kWords = kTitle.split(/\s+/).filter((w) => w.length > 3);
+      if (kWords.length < 2) continue;
+
+      const kYes = (kalshi.external_odds as Record<string, number>)?.yes || 0.5;
+
+      const sourceData: Record<
+        string,
+        { market_id: string; yes_probability: number; title: string }
+      > = {
+        kalshi: {
+          market_id: kalshi.id as string,
+          yes_probability: Math.round(kYes * 100),
+          title: kalshi.title as string,
+        },
+      };
+
+      let maxSpread = 0;
+      let forecasterDepth: number | null = null;
+
+      // Match Polymarket
+      for (const poly of polyMarkets) {
+        const pTitle = (poly.title as string)
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, "");
+        const pWords = pTitle.split(/\s+/).filter((w) => w.length > 3);
+        const overlap = kWords.filter((w) => pWords.includes(w)).length;
+
+        if (overlap >= 2) {
+          const pYes =
+            (poly.external_odds as Record<string, number>)?.yes || 0.5;
+          sourceData["polymarket"] = {
+            market_id: poly.id as string,
+            yes_probability: Math.round(pYes * 100),
+            title: poly.title as string,
+          };
+          maxSpread = Math.max(maxSpread, Math.abs(kYes - pYes));
+          break;
+        }
+      }
+
+      // Match Metaculus
+      for (const meta of metaculusMarkets) {
+        const mTitle = (meta.title as string)
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, "");
+        const mWords = mTitle.split(/\s+/).filter((w) => w.length > 3);
+        const overlap = kWords.filter((w) => mWords.includes(w)).length;
+
+        if (overlap >= 2) {
+          const mYes =
+            (meta.external_odds as Record<string, number>)?.yes || 0.5;
+          sourceData["metaculus"] = {
+            market_id: meta.id as string,
+            yes_probability: Math.round(mYes * 100),
+            title: meta.title as string,
+          };
+          maxSpread = Math.max(maxSpread, Math.abs(kYes - mYes));
+
+          // Get forecaster count from Metaculus
+          const rawData = meta.raw_data as Record<string, unknown>;
+          forecasterDepth =
+            (rawData?.forecaster_count as number) ||
+            (rawData?.nr_forecasters as number) ||
+            null;
+          break;
+        }
+      }
+
+      // Also check Polymarket vs Metaculus spread
+      if (sourceData["polymarket"] && sourceData["metaculus"]) {
+        const pYes = sourceData["polymarket"].yes_probability / 100;
+        const mYes = sourceData["metaculus"].yes_probability / 100;
+        maxSpread = Math.max(maxSpread, Math.abs(pYes - mYes));
+      }
+
+      // Only include if we have 2+ sources and spread meets threshold
+      if (
+        Object.keys(sourceData).length >= 2 &&
+        maxSpread >= minSpreadDecimal
+      ) {
+        divergences.push({
+          title: kalshi.title as string,
+          category: kalshi.category as string,
+          sources: sourceData,
+          max_spread: parseFloat((maxSpread * 100).toFixed(1)),
+          classification:
+            maxSpread >= 0.15
+              ? "STRONG"
+              : maxSpread >= 0.08
+                ? "MODERATE"
+                : "WEAK",
+          forecaster_depth: forecasterDepth,
+        });
+      }
+    }
+
+    // Sort by spread descending
+    divergences.sort((a, b) => b.max_spread - a.max_spread);
+    const results = divergences.slice(0, effectiveLimit);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              divergences: results,
+              summary: {
+                total_found: divergences.length,
+                returned: results.length,
+                strong: divergences.filter((d) => d.classification === "STRONG")
+                  .length,
+                moderate: divergences.filter(
+                  (d) => d.classification === "MODERATE",
+                ).length,
+                weak: divergences.filter((d) => d.classification === "WEAK")
+                  .length,
+                min_spread_filter: min_spread,
+                sources_scanned: {
+                  kalshi: kalshiMarkets.length,
+                  polymarket: polyMarkets.length,
+                  metaculus: metaculusMarkets.length,
+                },
+              },
+              _note:
+                "Divergences show where prediction sources disagree. STRONG divergences (>15%) are rare and high-value — at least one source is significantly wrong. Metaculus forecaster_depth indicates crowd wisdom backing.",
+            },
+            null,
+            2,
+          ),
         },
       ],
     };
