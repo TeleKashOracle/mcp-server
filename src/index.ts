@@ -112,7 +112,7 @@ Example queries:
     name: "list_markets",
     description: `Browse and discover prediction markets across 7 categories with filtering and sorting.
 
-Lists active betting markets from Kalshi and Polymarket. Filter by category, sort by trading volume, probability, or closing date. 480+ markets available.
+Lists active betting markets from Kalshi, Polymarket, and Metaculus. Filter by category, sort by trading volume, probability, or closing date. 500+ markets available.
 Categories: sports, crypto, politics, economics, pop_culture, weather, other.
 Use when exploring what predictions are available, finding trending markets, or discovering betting opportunities.
 
@@ -149,7 +149,7 @@ Example queries:
         },
         source: {
           type: "string",
-          enum: ["all", "kalshi", "polymarket"],
+          enum: ["all", "kalshi", "polymarket", "metaculus"],
           description: "Filter by data source (default: all)",
         },
       },
@@ -181,9 +181,9 @@ Essential for backtesting strategies, identifying probability swings, and spotti
   },
   {
     name: "search_markets",
-    description: `Search 480+ prediction markets by keyword, topic, or natural language query.
+    description: `Search 500+ prediction markets by keyword, topic, or natural language query.
 
-Full-text search across Kalshi and Polymarket. Finds markets matching any topic — politics, crypto, sports, economics, entertainment, science, technology, weather.
+Full-text search across Kalshi, Polymarket, and Metaculus. Finds markets matching any topic — politics, crypto, sports, economics, entertainment, science, technology, weather.
 Returns matching active markets sorted by relevance and trading volume.
 Use when looking for specific predictions, events, or outcomes to bet on.
 
@@ -1090,14 +1090,36 @@ class TeleKashMCPServer {
       .gte("recorded_at", startTime)
       .order("recorded_at", { ascending: true });
 
-    // Calculate momentum from history
+    // Calculate momentum and noise from history
     let momentum = 0;
+    let signalQuality = "insufficient_data";
+    let reversals = 0;
     if (historyData && historyData.length >= 2) {
-      const first = (historyData[0] as { probability: number }).probability;
-      const last = (
-        historyData[historyData.length - 1] as { probability: number }
-      ).probability;
+      const probs = historyData.map(
+        (h: Record<string, unknown>) => h.probability as number,
+      );
+      const first = probs[0];
+      const last = probs[probs.length - 1];
       momentum = last - first;
+
+      // Noise detection
+      let sustainedMoves = 0;
+      for (let i = 2; i < probs.length; i++) {
+        const prevDir = probs[i - 1] - probs[i - 2];
+        const currDir = probs[i] - probs[i - 1];
+        if (prevDir * currDir < 0) reversals++;
+        else if (Math.abs(currDir) > 0.001) sustainedMoves++;
+      }
+      const totalMoves = Math.max(1, reversals + sustainedMoves);
+      const signalRatio = sustainedMoves / totalMoves;
+      signalQuality =
+        probs.length < 3
+          ? "insufficient_data"
+          : signalRatio >= 0.6
+            ? "signal"
+            : signalRatio >= 0.4
+              ? "weak"
+              : "noise";
     }
 
     // Probability score: distance from 50% = stronger conviction
@@ -1176,8 +1198,18 @@ class TeleKashMCPServer {
                   momentum_24h: parseFloat(momentumScore.toFixed(3)),
                 },
                 signals,
+                noise_filter: {
+                  signal_quality: signalQuality,
+                  reversals_24h: reversals,
+                  _note:
+                    signalQuality === "noise"
+                      ? "WARNING: This momentum is likely noise — high reversal rate in 24h snapshots"
+                      : signalQuality === "signal"
+                        ? "Sustained directional move — higher confidence in momentum signal"
+                        : undefined,
+                },
                 analyzed_at: new Date().toISOString(),
-                version: "live-v1",
+                version: "live-v2",
               },
             },
             null,
@@ -1354,35 +1386,84 @@ class TeleKashMCPServer {
       };
     }
 
-    // Group by market_id, find first and last probability
-    const marketSwings: Record<
+    // Group by market_id, collect ALL snapshots for noise analysis
+    const marketSnapshots: Record<
       string,
-      { first: number; last: number; market_id: string }
+      { probabilities: number[]; market_id: string }
     > = {};
     for (const h of historyData) {
       const entry = h as { market_id: string; probability: number };
-      if (!marketSwings[entry.market_id]) {
-        marketSwings[entry.market_id] = {
-          first: entry.probability,
-          last: entry.probability,
+      if (!marketSnapshots[entry.market_id]) {
+        marketSnapshots[entry.market_id] = {
+          probabilities: [],
           market_id: entry.market_id,
         };
       }
-      marketSwings[entry.market_id].last = entry.probability;
+      marketSnapshots[entry.market_id].probabilities.push(entry.probability);
     }
 
-    // Calculate absolute change and sort
-    const swings = Object.values(marketSwings)
-      .map((s) => ({
-        market_id: s.market_id,
-        change: Math.round((s.last - s.first) * 100),
-        abs_change: Math.abs(Math.round((s.last - s.first) * 100)),
-        direction:
-          s.last > s.first ? "up" : s.last < s.first ? "down" : "stable",
-        from_probability: Math.round(s.first * 100),
-        to_probability: Math.round(s.last * 100),
-      }))
-      .sort((a, b) => b.abs_change - a.abs_change)
+    // Noise filter: "58% of price moves are noise" — Magician's Playbook #3
+    // Real signal = sustained directional move across multiple snapshots
+    // Noise = random walk with serial correlation reversal
+    const swings = Object.values(marketSnapshots)
+      .map((s) => {
+        const probs = s.probabilities;
+        const first = probs[0];
+        const last = probs[probs.length - 1];
+        const change = last - first;
+
+        // Noise detection: count direction reversals
+        let reversals = 0;
+        let sustainedMoves = 0;
+        for (let i = 2; i < probs.length; i++) {
+          const prevDir = probs[i - 1] - probs[i - 2];
+          const currDir = probs[i] - probs[i - 1];
+          if (prevDir * currDir < 0) reversals++;
+          else if (Math.abs(currDir) > 0.001) sustainedMoves++;
+        }
+
+        // Signal quality: high reversals = noise, sustained moves = signal
+        const totalMoves = Math.max(1, reversals + sustainedMoves);
+        const signalRatio = sustainedMoves / totalMoves;
+
+        // Classify: SIGNAL (>60% sustained), WEAK (40-60%), NOISE (<40%)
+        const signalQuality =
+          probs.length < 3
+            ? "insufficient_data"
+            : signalRatio >= 0.6
+              ? "signal"
+              : signalRatio >= 0.4
+                ? "weak"
+                : "noise";
+
+        return {
+          market_id: s.market_id,
+          change: Math.round(change * 100),
+          abs_change: Math.abs(Math.round(change * 100)),
+          direction: last > first ? "up" : last < first ? "down" : "stable",
+          from_probability: Math.round(first * 100),
+          to_probability: Math.round(last * 100),
+          snapshots: probs.length,
+          signal_quality: signalQuality,
+          signal_ratio: Math.round(signalRatio * 100) / 100,
+          reversals,
+        };
+      })
+      .filter((s) => s.abs_change > 0) // Only markets that actually moved
+      .sort((a, b) => {
+        // Signal-quality markets first, then by abs_change
+        const qualityOrder: Record<string, number> = {
+          signal: 0,
+          weak: 1,
+          noise: 2,
+          insufficient_data: 3,
+        };
+        const qDiff =
+          (qualityOrder[a.signal_quality] || 3) -
+          (qualityOrder[b.signal_quality] || 3);
+        if (qDiff !== 0) return qDiff;
+        return b.abs_change - a.abs_change;
+      })
       .slice(0, effectiveLimit);
 
     // Enrich with market details
@@ -1405,6 +1486,13 @@ class TeleKashMCPServer {
       closes_at: marketMap[s.market_id]?.closes_at,
     }));
 
+    const signalCount = trending.filter(
+      (t) => t.signal_quality === "signal",
+    ).length;
+    const noiseCount = trending.filter(
+      (t) => t.signal_quality === "noise",
+    ).length;
+
     return {
       content: [
         {
@@ -1414,6 +1502,12 @@ class TeleKashMCPServer {
               timeframe,
               trending,
               total: trending.length,
+              noise_filter: {
+                signal_markets: signalCount,
+                noise_markets: noiseCount,
+                _note:
+                  "58% of price moves are noise (serial correlation reversal). signal_quality: 'signal' = sustained directional move, 'weak' = mixed, 'noise' = random walk reverting. Prioritize 'signal' markets for real momentum.",
+              },
             },
             null,
             2,
@@ -1649,7 +1743,7 @@ class TeleKashMCPServer {
                 total_found: 1,
                 min_spread_filter: minSpread,
                 _note:
-                  "Demo mode. Connect to TeleKash for live arbitrage detection across 480+ markets.",
+                  "Demo mode. Connect to TeleKash for live arbitrage detection across 500+ markets.",
               },
               null,
               2,
