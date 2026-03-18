@@ -1,6 +1,7 @@
 {
   "name": "telekash-mcp-server",
-  "version": "0.6.0",
+  "version": "0.6.1",
+  "mcpName": "io.github.TeleKashOracle/mcp-server",
   "description": "Prediction market probability oracle for AI agents. 13 tools across 500+ live markets from Kalshi, Polymarket & Metaculus. Structured TPF signals, cross-source arbitrage, noise detection, agent performance tracking with Brier scores. The probability oracle for the agent economy.",
   "main": "dist/index.js",
   "bin": {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.telekash/mcp-server",
-  "description": "Prediction market probability oracle for AI agents. 12 tools across 500+ live markets from Kalshi, Polymarket & Metaculus. Structured TPF signals, cross-source arbitrage, noise detection, agent performance tracking with Brier scores. The probability oracle for the agent economy.",
+  "name": "io.github.TeleKashOracle/mcp-server",
+  "description": "Prediction market probability oracle for AI agents. 15 tools across 500+ live markets from Kalshi, Polymarket & Metaculus. Structured TPF signals, cross-source arbitrage, noise detection, agent performance tracking with Brier scores. The probability oracle for the agent economy.",
   "repository": {
     "url": "https://github.com/TeleKashOracle/mcp-server",
     "source": "github"
@@ -11,7 +11,7 @@
     {
       "registryType": "npm",
       "identifier": "telekash-mcp-server",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "transport": {
         "type": "stdio"
       },
