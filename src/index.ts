@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (14 live):
+ * Oracle Tools (15 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -22,6 +22,7 @@
  * - get_performance: Agent accuracy metrics (Brier score, calibration, edge)
  * - get_divergences: Consensus divergence detection across all sources
  * - get_edge: Capital efficiency — Kelly Criterion optimal position sizing
+ * - create_market: Create agent-powered prediction markets
  *
  * @version 0.6.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
@@ -515,6 +516,73 @@ Use this when an agent has limited capital and needs to maximize expected return
       required: [],
     },
   },
+  {
+    name: "create_market",
+    description: `Create a custom prediction market on TeleKash. Markets are binary YES/NO questions that resolve on a specified date.
+
+Markets created via this tool are tagged as "agent-created" and appear alongside Kalshi/Polymarket/Metaculus markets. Other agents can query, predict on, and trade these markets.
+
+Requirements:
+- Clear YES/NO question in the title
+- Resolution date in the future
+- Category for discoverability
+- Resolution criteria (how to determine the outcome)
+
+Created markets start with 50/50 odds. Probability moves as predictions come in.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        title: {
+          type: "string",
+          description:
+            "The prediction question (should be answerable with YES or NO)",
+        },
+        description: {
+          type: "string",
+          description: "Detailed description and context for the market",
+        },
+        category: {
+          type: "string",
+          enum: [
+            "crypto",
+            "politics",
+            "economics",
+            "sports",
+            "weather",
+            "other",
+          ],
+          description: "Market category",
+        },
+        closes_at: {
+          type: "string",
+          description: "When trading closes (ISO 8601 datetime)",
+        },
+        resolves_at: {
+          type: "string",
+          description:
+            "When the market resolves (ISO 8601 datetime, must be after closes_at)",
+        },
+        resolution_criteria: {
+          type: "string",
+          description:
+            "How the outcome will be determined (e.g., 'Based on CoinGecko BTC price at midnight UTC')",
+        },
+        creator_id: {
+          type: "string",
+          description:
+            "Agent identifier creating this market (used for attribution)",
+        },
+      },
+      required: [
+        "title",
+        "category",
+        "closes_at",
+        "resolves_at",
+        "resolution_criteria",
+        "creator_id",
+      ],
+    },
+  },
   // ===========================================
   // AGENT TRADING TOOLS — Coming soon (pool infrastructure built, awaiting liquidity)
   // Uncomment when agent pools are funded and active
@@ -813,6 +881,20 @@ class TeleKashMCPServer {
                   category?: string;
                   min_confidence?: string;
                   limit?: number;
+                },
+              ),
+            );
+          case "create_market":
+            return addCitation(
+              await this.createMarket(
+                args as {
+                  title: string;
+                  description?: string;
+                  category: string;
+                  closes_at: string;
+                  resolves_at: string;
+                  resolution_criteria: string;
+                  creator_id: string;
                 },
               ),
             );
@@ -2555,6 +2637,202 @@ class TeleKashMCPServer {
         {
           type: "text",
           text: JSON.stringify(tpf, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // CREATE MARKET — Agent-created prediction markets
+  // ===========================================
+
+  private async createMarket(args: {
+    title: string;
+    description?: string;
+    category: string;
+    closes_at: string;
+    resolves_at: string;
+    resolution_criteria: string;
+    creator_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const {
+      title,
+      description,
+      category,
+      closes_at,
+      resolves_at,
+      resolution_criteria,
+      creator_id,
+    } = args;
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Validate dates
+    const closeDate = new Date(closes_at);
+    const resolveDate = new Date(resolves_at);
+    const now = new Date();
+
+    if (isNaN(closeDate.getTime()) || isNaN(resolveDate.getTime())) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error:
+                  "Invalid date format. Use ISO 8601 (e.g., 2026-04-01T00:00:00Z)",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    if (closeDate <= now) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "closes_at must be in the future" },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    if (resolveDate <= closeDate) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "resolves_at must be after closes_at" },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Validate category
+    const validCategories = [
+      "crypto",
+      "politics",
+      "economics",
+      "sports",
+      "weather",
+      "other",
+    ];
+    if (!validCategories.includes(category)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: `Invalid category. Must be one of: ${validCategories.join(", ")}`,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Generate external_id
+    const slug = title
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .replace(/\s+/g, "-")
+      .slice(0, 50);
+    const externalId = `agent-${slug}-${Date.now().toString(36)}`;
+
+    // Create the market
+    const { data: market, error } = await this.supabase
+      .from("telekash_markets")
+      .insert({
+        external_id: externalId,
+        source: "agent",
+        source_url: null,
+        title,
+        description: description || null,
+        category,
+        subcategory: null,
+        outcomes: ["Yes", "No"],
+        external_odds: { yes: 0.5, no: 0.5 },
+        resolution_source: "agent",
+        status: "active",
+        closes_at: closeDate.toISOString(),
+        resolves_at: resolveDate.toISOString(),
+        raw_data: {
+          created_by: creator_id,
+          resolution_criteria,
+          source_type: "agent-created",
+          volume: 0,
+          liquidity: 0,
+        },
+      })
+      .select("id, external_id, title, category, closes_at, resolves_at")
+      .single();
+
+    if (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Failed to create market",
+                details: error.message,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              success: true,
+              market: {
+                id: market.id,
+                external_id: market.external_id,
+                title: market.title,
+                category: market.category,
+                closes_at: market.closes_at,
+                resolves_at: market.resolves_at,
+                initial_odds: "50/50",
+                resolution_criteria,
+                created_by: creator_id,
+              },
+              _note:
+                "Market created successfully. Other agents can now query this market via get_probability, get_signal, and track_prediction. Odds will move as predictions accumulate.",
+            },
+            null,
+            2,
+          ),
         },
       ],
     };
