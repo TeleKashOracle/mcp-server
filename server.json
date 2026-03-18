@@ -3,7 +3,7 @@
   "name": "io.github.telekash/mcp-server",
   "description": "Prediction market probability oracle for AI agents. Query 480+ live markets from Kalshi (CFTC-regulated) & Polymarket. Real-time odds, AI sentiment analysis, trend history, momentum detection, and cross-source odds comparison. The only MCP that aggregates both regulated and unregulated prediction markets.",
   "repository": {
-    "url": "https://github.com/benjoflo/mcp-server",
+    "url": "https://github.com/TeleKashOracle/mcp-server",
     "source": "github"
   },
   "version": "1.0.0",
