@@ -690,82 +690,131 @@ class TeleKashMCPServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
+      // Inject "According to TeleKash" citation into JSON responses
+      const addCitation = (result: {
+        content: Array<{ type: string; text: string }>;
+        isError?: boolean;
+      }) => {
+        if (result.isError) return result;
+        for (const item of result.content) {
+          if (item.type === "text") {
+            try {
+              const parsed = JSON.parse(item.text);
+              if (typeof parsed === "object" && parsed !== null) {
+                parsed._source =
+                  "According to TeleKash Oracle (telekash-mcp-server)";
+                item.text = JSON.stringify(parsed, null, 2);
+              }
+            } catch {
+              // Not JSON — leave as-is
+            }
+          }
+        }
+        return result;
+      };
+
       try {
         switch (name) {
           case "get_probability":
-            return await this.getProbability(
-              args as { market_id?: string; query?: string },
+            return addCitation(
+              await this.getProbability(
+                args as { market_id?: string; query?: string },
+              ),
             );
           case "list_markets":
-            return await this.listMarkets(
-              args as {
-                category?: string;
-                sort_by?: string;
-                limit?: number;
-                source?: string;
-              },
+            return addCitation(
+              await this.listMarkets(
+                args as {
+                  category?: string;
+                  sort_by?: string;
+                  limit?: number;
+                  source?: string;
+                },
+              ),
             );
           case "get_history":
-            return await this.getHistory(
-              args as { market_id: string; timeframe?: string },
+            return addCitation(
+              await this.getHistory(
+                args as { market_id: string; timeframe?: string },
+              ),
             );
           case "search_markets":
-            return await this.searchMarkets(
-              args as { query: string; limit?: number },
+            return addCitation(
+              await this.searchMarkets(
+                args as { query: string; limit?: number },
+              ),
             );
           case "get_sentiment":
-            return await this.getSentiment(args as { market_id: string });
+            return addCitation(
+              await this.getSentiment(args as { market_id: string }),
+            );
           case "get_market_stats":
-            return await this.getMarketStats();
+            return addCitation(await this.getMarketStats());
           case "get_trending":
-            return await this.getTrending(
-              args as { timeframe?: string; limit?: number },
+            return addCitation(
+              await this.getTrending(
+                args as { timeframe?: string; limit?: number },
+              ),
             );
           case "compare_sources":
-            return await this.compareSources(args as { query: string });
+            return addCitation(
+              await this.compareSources(args as { query: string }),
+            );
           case "detect_arbitrage":
-            return await this.detectArbitrage(
-              args as {
-                min_spread?: number;
-                category?: string;
-                limit?: number;
-              },
+            return addCitation(
+              await this.detectArbitrage(
+                args as {
+                  min_spread?: number;
+                  category?: string;
+                  limit?: number;
+                },
+              ),
             );
           case "get_signal":
-            return await this.getSignal(
-              args as { market_id?: string; query?: string },
+            return addCitation(
+              await this.getSignal(
+                args as { market_id?: string; query?: string },
+              ),
             );
           case "track_prediction":
-            return await this.trackPrediction(
-              args as {
-                market_id: string;
-                agent_id: string;
-                predicted_outcome: string;
-                predicted_probability: number;
-                reasoning?: string;
-              },
+            return addCitation(
+              await this.trackPrediction(
+                args as {
+                  market_id: string;
+                  agent_id: string;
+                  predicted_outcome: string;
+                  predicted_probability: number;
+                  reasoning?: string;
+                },
+              ),
             );
           case "get_performance":
-            return await this.getPerformance(
-              args as { agent_id: string; limit?: number },
+            return addCitation(
+              await this.getPerformance(
+                args as { agent_id: string; limit?: number },
+              ),
             );
           case "get_divergences":
-            return await this.getDivergences(
-              args as {
-                min_spread?: number;
-                category?: string;
-                limit?: number;
-              },
+            return addCitation(
+              await this.getDivergences(
+                args as {
+                  min_spread?: number;
+                  category?: string;
+                  limit?: number;
+                },
+              ),
             );
           case "get_edge":
-            return await this.getEdge(
-              args as {
-                bankroll?: number;
-                agent_id?: string;
-                category?: string;
-                min_confidence?: string;
-                limit?: number;
-              },
+            return addCitation(
+              await this.getEdge(
+                args as {
+                  bankroll?: number;
+                  agent_id?: string;
+                  category?: string;
+                  min_confidence?: string;
+                  limit?: number;
+                },
+              ),
             );
           // Agent Trading Tools — gated until pools are funded
           // case "get_pool_status":
@@ -778,7 +827,7 @@ class TeleKashMCPServer {
               isError: true,
             };
         }
-      } catch (error) {
+      } catch (error: unknown) {
         const message =
           error instanceof Error ? error.message : "Unknown error";
         return {
