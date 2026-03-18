@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (15 live):
+ * Oracle Tools (20 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -23,8 +23,13 @@
  * - get_divergences: Consensus divergence detection across all sources
  * - get_edge: Capital efficiency — Kelly Criterion optimal position sizing
  * - create_market: Create agent-powered prediction markets
+ * - generate_api_key: Self-provision API keys for rate-limited access
+ * - get_usage: Check current tier, usage, and rate limits
+ * - register_alert: Webhook alerts for market events (Edge tier)
+ * - list_alerts: List active webhook alerts
+ * - delete_alert: Remove a webhook alert
  *
- * @version 0.6.0
+ * @version 0.7.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
  */
 
@@ -37,6 +42,98 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { createHash } from "crypto";
+
+// ============================================
+// TIER SYSTEM — Free / Calibration ($99/mo) / Edge ($499/mo)
+// ============================================
+
+type Tier = "free" | "calibration" | "edge";
+
+interface TierConfig {
+  calls_per_day: number;
+  sources: string[];
+  tools: string[];
+}
+
+const TIER_CONFIGS: Record<Tier, TierConfig> = {
+  free: {
+    calls_per_day: 100,
+    sources: ["kalshi", "polymarket"],
+    tools: [
+      "get_probability",
+      "list_markets",
+      "search_markets",
+      "get_history",
+      "get_sentiment",
+      "get_market_stats",
+      "get_trending",
+      "generate_api_key",
+      "get_usage",
+    ],
+  },
+  calibration: {
+    calls_per_day: 1000,
+    sources: ["kalshi", "polymarket", "metaculus"],
+    tools: [
+      "get_probability",
+      "list_markets",
+      "search_markets",
+      "get_history",
+      "get_sentiment",
+      "get_market_stats",
+      "get_trending",
+      "compare_sources",
+      "detect_arbitrage",
+      "get_divergences",
+      "track_prediction",
+      "get_performance",
+      "generate_api_key",
+      "get_usage",
+    ],
+  },
+  edge: {
+    calls_per_day: 999999,
+    sources: ["kalshi", "polymarket", "metaculus"],
+    tools: [
+      "get_probability",
+      "list_markets",
+      "search_markets",
+      "get_history",
+      "get_sentiment",
+      "get_market_stats",
+      "get_trending",
+      "compare_sources",
+      "detect_arbitrage",
+      "get_divergences",
+      "track_prediction",
+      "get_performance",
+      "get_signal",
+      "get_edge",
+      "create_market",
+      "generate_api_key",
+      "get_usage",
+      "register_alert",
+      "list_alerts",
+      "delete_alert",
+    ],
+  },
+};
+
+// Tools that require specific tiers (used for error messages)
+const TIER_REQUIRED: Record<string, Tier> = {
+  compare_sources: "calibration",
+  detect_arbitrage: "calibration",
+  get_divergences: "calibration",
+  track_prediction: "calibration",
+  get_performance: "calibration",
+  get_signal: "edge",
+  get_edge: "edge",
+  create_market: "edge",
+  register_alert: "edge",
+  list_alerts: "edge",
+  delete_alert: "edge",
+};
 
 // Types
 interface Market {
@@ -588,6 +685,133 @@ Created markets start with 50/50 odds. Probability moves as predictions come in.
   // Uncomment when agent pools are funded and active
   // Tools: get_pool_status, execute_trade, get_agent_positions, get_recommended_position_size
   // ===========================================
+  // ===========================================
+  // API KEY MANAGEMENT
+  // ===========================================
+  {
+    name: "generate_api_key",
+    description: `Generate a free TeleKash API key for rate-limited access to prediction market intelligence.
+
+Free tier: 100 calls/day, 7 core tools (probability, markets, search, history, sentiment, stats, trending).
+Calibration tier ($99/mo): 1,000 calls/day + arbitrage, divergence, and performance tracking tools.
+Edge tier ($499/mo): Unlimited + TPF signals, Kelly sizing, and market creation.
+
+The API key is returned ONCE — save it immediately. Set it as TELEKASH_API_KEY environment variable.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        owner_id: {
+          type: "string",
+          description:
+            "Your agent or user identifier (used for key management)",
+        },
+        owner_email: {
+          type: "string",
+          description: "Contact email (optional, for billing if upgrading)",
+        },
+      },
+      required: ["owner_id"],
+    },
+  },
+  {
+    name: "get_usage",
+    description: `Check your current API usage, rate limits, and tier status.
+
+Returns calls made today, calls remaining, tier, and upgrade options.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+      required: [],
+    },
+  },
+  // ===========================================
+  // WEBHOOK ALERT TOOLS (Edge tier)
+  // ===========================================
+  {
+    name: "register_alert",
+    description: `Register a webhook alert for prediction market events. When the condition is met, TeleKash POSTs TPF-formatted data to your callback URL.
+
+Available conditions:
+- probability_crosses_above: Triggered when market probability rises above threshold (e.g., 70%)
+- probability_crosses_below: Triggered when market probability falls below threshold (e.g., 30%)
+- mispricing_detected: Triggered when cross-source spread exceeds threshold (e.g., 5%)
+- volume_spike: Triggered when 1h volume exceeds threshold multiple of average
+- resolution: Triggered when market resolves (no threshold needed)
+- divergence_detected: Triggered when any source disagrees beyond threshold
+
+Alerts auto-expire after 30 days. Cooldown prevents duplicate triggers (default: 60 min).
+Event-driven, not polling — your agent sleeps until we wake it up.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "Your agent identifier",
+        },
+        market_id: {
+          type: "string",
+          description:
+            "Market UUID or external_id. Omit for cross-market alerts (mispricing, divergence)",
+        },
+        condition: {
+          type: "string",
+          enum: [
+            "probability_crosses_above",
+            "probability_crosses_below",
+            "mispricing_detected",
+            "volume_spike",
+            "resolution",
+            "divergence_detected",
+          ],
+          description: "What event triggers the alert",
+        },
+        threshold: {
+          type: "number",
+          description:
+            "Trigger threshold (probability %, spread %, or volume multiplier). Not needed for 'resolution'.",
+        },
+        callback_url: {
+          type: "string",
+          description:
+            "URL to POST alert data to when triggered (must be https)",
+        },
+        cooldown_minutes: {
+          type: "number",
+          description:
+            "Minimum minutes between triggers for this alert (default: 60)",
+        },
+      },
+      required: ["agent_id", "condition", "callback_url"],
+    },
+  },
+  {
+    name: "list_alerts",
+    description: `List all active webhook alerts for your agent. Shows condition, threshold, last triggered, and delivery stats.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "Your agent identifier",
+        },
+      },
+      required: ["agent_id"],
+    },
+  },
+  {
+    name: "delete_alert",
+    description: `Delete a webhook alert by ID. The alert will stop firing immediately.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        alert_id: {
+          type: "string",
+          description: "The alert UUID to delete",
+        },
+      },
+      required: ["alert_id"],
+    },
+  },
 ];
 
 // Confidence score computation — volume-weighted probability conviction
@@ -714,12 +938,16 @@ function buildVerdictReasoning(
 class TeleKashMCPServer {
   private server: Server;
   private supabase: SupabaseClient | null = null;
+  private tier: Tier = "free";
+  private apiKeyId: string | null = null;
+  private apiKeyHash: string | null = null;
+  private callsRemaining: number = 100;
 
   constructor() {
     this.server = new Server(
       {
         name: "telekash-oracle",
-        version: "0.5.0",
+        version: "0.7.0",
       },
       {
         capabilities: {
@@ -729,6 +957,7 @@ class TeleKashMCPServer {
     );
 
     this.initializeSupabase();
+    this.initializeApiKey();
     this.setupHandlers();
   }
 
@@ -748,15 +977,142 @@ class TeleKashMCPServer {
     }
   }
 
+  private initializeApiKey(): void {
+    const apiKey = process.env.TELEKASH_API_KEY;
+    if (apiKey) {
+      this.apiKeyHash = createHash("sha256").update(apiKey).digest("hex");
+      console.error(
+        `[TeleKash MCP] API key detected (${apiKey.substring(0, 16)}...)`,
+      );
+    } else {
+      console.error(
+        "[TeleKash MCP] No API key — running in free tier (100 calls/day)",
+      );
+    }
+  }
+
+  private async checkTierAccess(toolName: string): Promise<{
+    allowed: boolean;
+    tier: Tier;
+    error?: string;
+  }> {
+    // If we have an API key + Supabase, check against DB
+    if (this.apiKeyHash && this.supabase) {
+      const { data, error } = await this.supabase.rpc("check_rate_limit", {
+        p_key_hash: this.apiKeyHash,
+      });
+
+      if (error) {
+        console.error("[TeleKash MCP] Rate limit check error:", error.message);
+        // Fail open — don't block if DB is down
+        return { allowed: true, tier: this.tier };
+      }
+
+      if (!data.allowed) {
+        if (data.reason === "invalid_key") {
+          return {
+            allowed: false,
+            tier: "free",
+            error:
+              "Invalid API key. Get a free key at https://t.me/TeleKashBot or use without a key for free tier.",
+          };
+        }
+        if (data.reason === "rate_limited") {
+          return {
+            allowed: false,
+            tier: data.tier,
+            error: `Rate limit exceeded. ${data.tier} tier: ${data.limit} calls/day. Resets at ${data.resets_at}. Upgrade at https://t.me/TeleKashBot`,
+          };
+        }
+        if (data.reason === "key_expired") {
+          return {
+            allowed: false,
+            tier: "free",
+            error:
+              "API key expired. Generate a new one at https://t.me/TeleKashBot",
+          };
+        }
+        return { allowed: false, tier: "free", error: data.reason };
+      }
+
+      // Update local tier info
+      this.tier = data.tier;
+      this.apiKeyId = data.key_id;
+      this.callsRemaining = data.remaining;
+    }
+
+    // Check tool access for the current tier
+    const tierConfig = TIER_CONFIGS[this.tier];
+    if (!tierConfig.tools.includes(toolName)) {
+      const requiredTier = TIER_REQUIRED[toolName] || "edge";
+      return {
+        allowed: false,
+        tier: this.tier,
+        error: `${toolName} requires ${requiredTier} tier ($${requiredTier === "calibration" ? "99" : "499"}/mo). Current tier: ${this.tier}. Upgrade at https://t.me/TeleKashBot`,
+      };
+    }
+
+    return { allowed: true, tier: this.tier };
+  }
+
+  private async logUsage(
+    toolName: string,
+    startTime: number,
+    argsHash?: string,
+  ): Promise<void> {
+    if (!this.supabase) return;
+
+    const responseTimeMs = Date.now() - startTime;
+    try {
+      await this.supabase.from("telekash_usage_logs").insert({
+        api_key_id: this.apiKeyId,
+        tool_name: toolName,
+        tier: this.tier,
+        args_hash: argsHash,
+        response_time_ms: responseTimeMs,
+      });
+    } catch {
+      // Don't fail the request if logging fails
+    }
+  }
+
   private setupHandlers(): void {
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: TOOLS,
-    }));
+    // List available tools — filtered by tier
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+      const tierConfig = TIER_CONFIGS[this.tier];
+      const visibleTools = TOOLS.filter((t) =>
+        tierConfig.tools.includes(t.name),
+      );
+      return { tools: visibleTools };
+    });
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
+      const startTime = Date.now();
+
+      // Check tier access + rate limit
+      const access = await this.checkTierAccess(name);
+      if (!access.allowed) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: "access_denied",
+                  message: access.error,
+                  tier: access.tier,
+                  upgrade_url: "https://t.me/TeleKashBot",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
 
       // Inject "According to TeleKash" citation into JSON responses
       const addCitation = (result: {
@@ -771,6 +1127,10 @@ class TeleKashMCPServer {
               if (typeof parsed === "object" && parsed !== null) {
                 parsed._source =
                   "According to TeleKash Oracle (telekash-mcp-server)";
+                parsed._tier = this.tier;
+                if (this.callsRemaining < 20) {
+                  parsed._rate_limit_warning = `${this.callsRemaining} calls remaining today (${this.tier} tier)`;
+                }
                 item.text = JSON.stringify(parsed, null, 2);
               }
             } catch {
@@ -780,6 +1140,14 @@ class TeleKashMCPServer {
         }
         return result;
       };
+
+      // Hash args for usage tracking
+      const argsHash = args
+        ? createHash("md5")
+            .update(JSON.stringify(args))
+            .digest("hex")
+            .substring(0, 8)
+        : undefined;
 
       try {
         switch (name) {
@@ -898,11 +1266,35 @@ class TeleKashMCPServer {
                 },
               ),
             );
-          // Agent Trading Tools — gated until pools are funded
-          // case "get_pool_status":
-          // case "execute_trade":
-          // case "get_agent_positions":
-          // case "get_recommended_position_size":
+          case "generate_api_key":
+            return addCitation(
+              await this.generateApiKey(
+                args as { owner_id: string; owner_email?: string },
+              ),
+            );
+          case "get_usage":
+            return addCitation(await this.getUsage());
+          case "register_alert":
+            return addCitation(
+              await this.registerAlert(
+                args as {
+                  agent_id: string;
+                  market_id?: string;
+                  condition: string;
+                  threshold?: number;
+                  callback_url: string;
+                  cooldown_minutes?: number;
+                },
+              ),
+            );
+          case "list_alerts":
+            return addCitation(
+              await this.listAlerts(args as { agent_id: string }),
+            );
+          case "delete_alert":
+            return addCitation(
+              await this.deleteAlert(args as { alert_id: string }),
+            );
           default:
             return {
               content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -916,6 +1308,9 @@ class TeleKashMCPServer {
           content: [{ type: "text", text: `Error: ${message}` }],
           isError: true,
         };
+      } finally {
+        // Log usage asynchronously (don't block response)
+        this.logUsage(name, startTime, argsHash).catch(() => {});
       }
     });
   }
@@ -4269,6 +4664,398 @@ class TeleKashMCPServer {
             null,
             2,
           ),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // WEBHOOK ALERT TOOLS
+  // ===========================================
+
+  private async registerAlert(args: {
+    agent_id: string;
+    market_id?: string;
+    condition: string;
+    threshold?: number;
+    callback_url: string;
+    cooldown_minutes?: number;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Validate callback URL
+    if (
+      !args.callback_url.startsWith("https://") &&
+      !args.callback_url.startsWith("http://localhost")
+    ) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error:
+                  "callback_url must use HTTPS (except localhost for testing)",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Validate condition requires threshold
+    if (
+      args.condition !== "resolution" &&
+      (args.threshold === undefined || args.threshold === null)
+    ) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: `Threshold required for '${args.condition}' condition`,
+                hint: args.condition.includes("probability")
+                  ? "Use a percentage value, e.g., 70 for 70%"
+                  : args.condition === "mispricing_detected" ||
+                      args.condition === "divergence_detected"
+                    ? "Use a spread percentage, e.g., 5 for 5% gap"
+                    : "Use a multiplier, e.g., 3 for 3x average volume",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Resolve market_id if it's an external_id
+    let resolvedMarketId = args.market_id || null;
+    if (args.market_id && args.market_id.length < 36) {
+      const { data: market } = await this.supabase
+        .from("telekash_markets")
+        .select("id")
+        .eq("external_id", args.market_id)
+        .single();
+      if (market) resolvedMarketId = market.id;
+    }
+
+    const { data, error } = await this.supabase
+      .from("telekash_alerts")
+      .insert({
+        agent_id: args.agent_id,
+        api_key_id: this.apiKeyId,
+        market_id: resolvedMarketId,
+        condition: args.condition,
+        threshold: args.threshold || null,
+        callback_url: args.callback_url,
+        cooldown_minutes: args.cooldown_minutes || 60,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to register alert", detail: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              alert_id: data.id,
+              status: "active",
+              condition: args.condition,
+              threshold: args.threshold,
+              market_id: resolvedMarketId,
+              callback_url: args.callback_url,
+              cooldown_minutes: args.cooldown_minutes || 60,
+              expires_at: data.expires_at,
+              message: `Alert registered. We'll POST to ${args.callback_url} when ${args.condition} ${args.threshold ? `(threshold: ${args.threshold})` : ""} triggers.`,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async listAlerts(args: {
+    agent_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const { data: alerts, error } = await this.supabase
+      .from("telekash_alerts")
+      .select(
+        "id, market_id, condition, threshold, callback_url, is_active, trigger_count, last_triggered_at, cooldown_minutes, created_at, expires_at",
+      )
+      .eq("agent_id", args.agent_id)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to list alerts", detail: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              agent_id: args.agent_id,
+              total_alerts: alerts?.length || 0,
+              active_alerts: alerts?.filter((a) => a.is_active).length || 0,
+              alerts: (alerts || []).map((a) => ({
+                ...a,
+                status: a.is_active ? "active" : "paused",
+                age:
+                  Math.round(
+                    (Date.now() - new Date(a.created_at).getTime()) /
+                      (1000 * 60 * 60),
+                  ) + "h",
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async deleteAlert(args: {
+    alert_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const { error } = await this.supabase
+      .from("telekash_alerts")
+      .delete()
+      .eq("id", args.alert_id);
+
+    if (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to delete alert", detail: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              deleted: true,
+              alert_id: args.alert_id,
+              message: "Alert deleted. No further webhooks will be sent.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // API KEY & USAGE TOOLS
+  // ===========================================
+
+  private async generateApiKey(args: {
+    owner_id: string;
+    owner_email?: string;
+  }): Promise<{
+    content: Array<{ type: "text"; text: string }>;
+  }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Database not configured",
+                message:
+                  "Set SUPABASE_URL and SUPABASE_ANON_KEY to generate API keys.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    const { data, error } = await this.supabase.rpc("generate_api_key", {
+      p_owner_id: args.owner_id,
+      p_tier: "free",
+      p_owner_email: args.owner_email || null,
+    });
+
+    if (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to generate key", detail: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              api_key: data.api_key,
+              tier: "free",
+              limits: {
+                calls_per_day: 100,
+                tools: TIER_CONFIGS.free.tools.length,
+                sources: TIER_CONFIGS.free.sources,
+              },
+              setup: {
+                env_variable: "TELEKASH_API_KEY",
+                example: `TELEKASH_API_KEY=${data.api_key}`,
+                claude_code: `claude mcp add telekash-oracle --env TELEKASH_API_KEY=${data.api_key} -- npx telekash-mcp-server`,
+              },
+              upgrade: {
+                calibration: {
+                  price: "$99/mo",
+                  calls_per_day: 1000,
+                  tools: TIER_CONFIGS.calibration.tools.length,
+                  includes:
+                    "arbitrage, divergences, cross-source, performance tracking",
+                },
+                edge: {
+                  price: "$499/mo",
+                  calls_per_day: "unlimited",
+                  tools: TIER_CONFIGS.edge.tools.length,
+                  includes:
+                    "TPF signals, Kelly sizing, market creation, all tools",
+                },
+                url: "https://t.me/TeleKashBot",
+              },
+              warning: "Save this key now — it cannot be retrieved again.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async getUsage(): Promise<{
+    content: Array<{ type: "text"; text: string }>;
+  }> {
+    const tierConfig = TIER_CONFIGS[this.tier];
+
+    const usage: Record<string, unknown> = {
+      tier: this.tier,
+      rate_limit: {
+        calls_per_day: tierConfig.calls_per_day,
+        calls_remaining: this.callsRemaining,
+        resets_at: new Date(new Date().setHours(24, 0, 0, 0)).toISOString(),
+      },
+      access: {
+        tools_available: tierConfig.tools.length,
+        tools: tierConfig.tools,
+        sources: tierConfig.sources,
+      },
+      has_api_key: !!this.apiKeyHash,
+    };
+
+    // Add upgrade info if not on edge
+    if (this.tier !== "edge") {
+      const nextTier = this.tier === "free" ? "calibration" : "edge";
+      const nextConfig = TIER_CONFIGS[nextTier];
+      usage.upgrade = {
+        next_tier: nextTier,
+        price: nextTier === "calibration" ? "$99/mo" : "$499/mo",
+        calls_per_day: nextConfig.calls_per_day,
+        additional_tools: nextConfig.tools.filter(
+          (t) => !tierConfig.tools.includes(t),
+        ),
+        url: "https://t.me/TeleKashBot",
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(usage, null, 2),
         },
       ],
     };
