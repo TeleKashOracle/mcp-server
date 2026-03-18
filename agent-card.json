@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/google/A2A/main/specification/json/a2a.schema.json",
   "name": "TeleKash Prediction Oracle",
-  "description": "Probability oracle for the agent economy. 20 tools across 500+ live prediction markets from Kalshi (CFTC-regulated), Polymarket, and Metaculus. Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
+  "description": "Probability oracle + trade broker for the agent economy. 23 tools across 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Smart trade routing with 1% commission, structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
   "url": "https://github.com/TeleKashOracle/mcp-server",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "capabilities": {
     "streaming": false,
     "pushNotifications": true,
@@ -111,6 +111,24 @@
       "examples": [
         "Create a market: Will ETH flip BTC by 2027?",
         "Set up a prediction market for the next election"
+      ]
+    },
+    {
+      "id": "trade-broker",
+      "name": "Smart Trade Routing Broker",
+      "description": "Execute trades on prediction markets through TeleKash. Smart router picks the best exchange (Kalshi or Polymarket) based on market source and price. Supports market and limit orders. 1% commission. Full order lifecycle: place, check status, cancel.",
+      "tags": [
+        "trading",
+        "broker",
+        "execution",
+        "order-routing",
+        "market-orders"
+      ],
+      "examples": [
+        "Buy $100 of YES on the Bitcoin $200K market",
+        "Place a limit order at 0.45 for NO on the election market",
+        "Check my order status",
+        "Cancel my pending order"
       ]
     }
   ],

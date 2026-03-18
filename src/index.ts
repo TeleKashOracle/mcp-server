@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (20 live):
+ * Oracle Tools (23 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -28,8 +28,11 @@
  * - register_alert: Webhook alerts for market events (Edge tier)
  * - list_alerts: List active webhook alerts
  * - delete_alert: Remove a webhook alert
+ * - execute_trade: Route trades to Kalshi/Polymarket via smart broker (1% commission)
+ * - get_order_status: Check broker order fill status
+ * - cancel_order: Cancel pending broker orders
  *
- * @version 0.7.0
+ * @version 0.8.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
  */
 
@@ -43,6 +46,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { createHash } from "crypto";
+import {
+  TeleKashBroker,
+  type BrokerOrder,
+  type BrokerResult,
+} from "./broker.js";
 
 // ============================================
 // TIER SYSTEM — Free / Calibration ($99/mo) / Edge ($499/mo)
@@ -116,6 +124,9 @@ const TIER_CONFIGS: Record<Tier, TierConfig> = {
       "register_alert",
       "list_alerts",
       "delete_alert",
+      "execute_trade",
+      "get_order_status",
+      "cancel_order",
     ],
   },
 };
@@ -175,6 +186,9 @@ const TIER_REQUIRED: Record<string, Tier> = {
   register_alert: "edge",
   list_alerts: "edge",
   delete_alert: "edge",
+  execute_trade: "edge",
+  get_order_status: "edge",
+  cancel_order: "edge",
 };
 
 // Types
@@ -860,6 +874,92 @@ Event-driven, not polling — your agent sleeps until we wake it up.`,
       required: ["alert_id"],
     },
   },
+  // ===== BROKER TOOLS (Edge tier) =====
+  {
+    name: "execute_trade",
+    description: `Execute a prediction market trade through TeleKash Broker.
+
+Routes your order to the best exchange (Kalshi or Polymarket) based on where the market trades.
+TeleKash handles authentication, order routing, and settlement. You just specify what to trade.
+
+Commission: 1% of trade amount.
+Requires: Edge tier API key + exchange credentials configured on the server.
+
+Returns: order_id, exchange_order_id, fill_price, commission, routing details.
+
+Example: Buy $50 of YES on "Bitcoin above $100K by December" → routes to Polymarket CLOB, fills at 0.62, commission $0.50.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        market_id: {
+          type: "string",
+          description:
+            "TeleKash market UUID or external_id (Kalshi ticker or Polymarket condition_id)",
+        },
+        side: {
+          type: "string",
+          enum: ["yes", "no"],
+          description: "Which outcome to buy: 'yes' or 'no'",
+        },
+        amount_usd: {
+          type: "number",
+          description: "Trade amount in USD. Min $1, max $10,000 per order.",
+        },
+        order_type: {
+          type: "string",
+          enum: ["market", "limit"],
+          description:
+            "Order type: 'market' (fill at best available price) or 'limit' (fill at limit_price or better). Default: market.",
+        },
+        limit_price: {
+          type: "number",
+          description:
+            "Limit price as probability 0-1 (e.g. 0.65 = 65 cents). Required for limit orders. Ignored for market orders.",
+        },
+        routing_preference: {
+          type: "string",
+          enum: ["kalshi", "polymarket", "best_price"],
+          description:
+            "Where to route: 'kalshi', 'polymarket', or 'best_price' (default). best_price routes to the source where this market trades.",
+        },
+      },
+      required: ["market_id", "side", "amount_usd"],
+    },
+  },
+  {
+    name: "get_order_status",
+    description: `Check the status of a broker order placed through execute_trade.
+
+Returns current fill status, price, amount filled, and commission.
+Queries the exchange directly for the latest status.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        order_id: {
+          type: "string",
+          description: "TeleKash broker order UUID (returned by execute_trade)",
+        },
+      },
+      required: ["order_id"],
+    },
+  },
+  {
+    name: "cancel_order",
+    description: `Cancel a pending or submitted broker order.
+
+Only works for orders that haven't been fully filled yet.
+Sends cancellation to the exchange and updates the order status.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        order_id: {
+          type: "string",
+          description: "TeleKash broker order UUID to cancel",
+        },
+      },
+      required: ["order_id"],
+    },
+  },
 ];
 
 // Confidence score computation — volume-weighted probability conviction
@@ -990,12 +1090,14 @@ class TeleKashMCPServer {
   private apiKeyId: string | null = null;
   private apiKeyHash: string | null = null;
   private callsRemaining: number = 100;
+  private broker: TeleKashBroker;
 
   constructor() {
+    this.broker = new TeleKashBroker();
     this.server = new Server(
       {
         name: "telekash-oracle",
-        version: "0.7.0",
+        version: "0.8.0",
       },
       {
         capabilities: {
@@ -1343,6 +1445,28 @@ class TeleKashMCPServer {
           case "delete_alert":
             return addCitation(
               await this.deleteAlert(args as { alert_id: string }),
+            );
+          // ===== BROKER TOOLS =====
+          case "execute_trade":
+            return addCitation(
+              await this.brokerExecuteTrade(
+                args as {
+                  market_id: string;
+                  side: "yes" | "no";
+                  amount_usd: number;
+                  order_type?: "market" | "limit";
+                  limit_price?: number;
+                  routing_preference?: "kalshi" | "polymarket" | "best_price";
+                },
+              ),
+            );
+          case "get_order_status":
+            return addCitation(
+              await this.brokerGetOrderStatus(args as { order_id: string }),
+            );
+          case "cancel_order":
+            return addCitation(
+              await this.brokerCancelOrder(args as { order_id: string }),
             );
           default:
             return {
@@ -5141,10 +5265,419 @@ class TeleKashMCPServer {
     };
   }
 
+  // ===========================================
+  // BROKER TOOLS — Trade execution via Kalshi/Polymarket
+  // ===========================================
+
+  private async brokerExecuteTrade(args: {
+    market_id: string;
+    side: "yes" | "no";
+    amount_usd: number;
+    order_type?: "market" | "limit";
+    limit_price?: number;
+    routing_preference?: "kalshi" | "polymarket" | "best_price";
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const { market_id, side, amount_usd } = args;
+    const order_type = args.order_type || "market";
+
+    // Validate amount
+    if (amount_usd < 1 || amount_usd > 10000) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Amount must be between $1 and $10,000" },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Limit orders require a price
+    if (order_type === "limit" && !args.limit_price) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error:
+                  "limit_price required for limit orders (0-1 probability)",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Check connected exchanges
+    const connected = this.broker.getConnectedExchanges();
+    if (connected.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "No exchange credentials configured",
+                help: "The server operator needs to set KALSHI_API_KEY + KALSHI_PRIVATE_KEY or POLY_API_KEY + POLY_API_SECRET + POLY_API_PASSPHRASE",
+                connected_exchanges: [],
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Look up market
+    const { data: market, error: marketError } = await this.supabase
+      .from("telekash_markets")
+      .select("*")
+      .or(`id.eq.${market_id},external_id.eq.${market_id}`)
+      .eq("status", "active")
+      .limit(1)
+      .single();
+
+    if (marketError || !market) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Market not found or not active",
+                market_id,
+                suggestion:
+                  "Use search_markets or list_markets to find valid market IDs",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Build broker order
+    const brokerOrder: BrokerOrder = {
+      agent_id: this.apiKeyId || "anonymous",
+      market_id,
+      side,
+      amount_usd,
+      order_type,
+      limit_price: args.limit_price,
+      routing_preference: args.routing_preference,
+    };
+
+    // Route and execute
+    const result: BrokerResult = await this.broker.routeOrder(brokerOrder, {
+      id: market.id,
+      external_id: market.external_id,
+      source: market.source,
+      title: market.title,
+      external_odds: market.external_odds,
+      status: market.status,
+      raw_data: market.raw_data,
+    });
+
+    // Record order in database
+    const { data: dbOrder } = await this.supabase
+      .from("telekash_broker_orders")
+      .insert({
+        api_key_id: this.apiKeyId,
+        agent_id: brokerOrder.agent_id,
+        market_id: market.id,
+        market_title: market.title,
+        side,
+        amount_usd,
+        price: args.limit_price || null,
+        order_type,
+        routed_to: result.routed_to || "unknown",
+        routing_reason: result.routing_reason,
+        exchange_order_id: result.exchange_order_id,
+        fill_price: result.fill_price,
+        fill_amount_usd: result.fill_amount_usd,
+        commission_usd: result.commission_usd,
+        commission_rate: 0.01,
+        status: result.status,
+        error_message: result.error,
+        submitted_at:
+          result.status !== "failed" ? new Date().toISOString() : null,
+        filled_at: result.status === "filled" ? new Date().toISOString() : null,
+      })
+      .select("id")
+      .single();
+
+    // Log commission as revenue
+    if (result.success && result.commission_usd && result.commission_usd > 0) {
+      await this.supabase
+        .from("telekash_revenue")
+        .insert({
+          source: "broker_commission",
+          amount_usd: result.commission_usd,
+          amount_stars: 0,
+          details: {
+            order_id: dbOrder?.id,
+            exchange: result.routed_to,
+            market_id: market.id,
+            market_title: market.title,
+            trade_amount: amount_usd,
+            commission_rate: 0.01,
+          },
+        })
+        .then(() => {});
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              success: result.success,
+              order: {
+                id: dbOrder?.id,
+                exchange_order_id: result.exchange_order_id,
+                market_title: market.title,
+                side,
+                amount_usd,
+                order_type,
+                routed_to: result.routed_to,
+                routing_reason: result.routing_reason,
+                fill_price: result.fill_price,
+                fill_amount_usd: result.fill_amount_usd,
+                commission_usd: result.commission_usd,
+                status: result.status,
+              },
+              connected_exchanges: connected,
+              ...(result.error ? { error: result.error } : {}),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async brokerGetOrderStatus(args: {
+    order_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Get order from DB
+    const { data: order, error } = await this.supabase
+      .from("telekash_broker_orders")
+      .select("*")
+      .eq("id", args.order_id)
+      .single();
+
+    if (error || !order) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Order not found", order_id: args.order_id },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // If order is still pending/submitted, check exchange for latest status
+    let exchangeStatus = null;
+    if (
+      order.exchange_order_id &&
+      (order.status === "submitted" || order.status === "pending")
+    ) {
+      exchangeStatus = await this.broker.getOrderStatus(
+        order.exchange_order_id,
+        order.routed_to,
+      );
+
+      // Update DB if status changed
+      if (exchangeStatus && exchangeStatus.status !== order.status) {
+        await this.supabase
+          .from("telekash_broker_orders")
+          .update({
+            status: exchangeStatus.status,
+            fill_price: exchangeStatus.fill_price || order.fill_price,
+            fill_amount_usd:
+              exchangeStatus.fill_amount_usd || order.fill_amount_usd,
+            filled_at:
+              exchangeStatus.status === "filled"
+                ? new Date().toISOString()
+                : null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", order.id);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              order_id: order.id,
+              market_title: order.market_title,
+              side: order.side,
+              amount_usd: order.amount_usd,
+              order_type: order.order_type,
+              routed_to: order.routed_to,
+              exchange_order_id: order.exchange_order_id,
+              status: exchangeStatus?.status || order.status,
+              fill_price: exchangeStatus?.fill_price || order.fill_price,
+              fill_amount_usd:
+                exchangeStatus?.fill_amount_usd || order.fill_amount_usd,
+              commission_usd: order.commission_usd,
+              created_at: order.created_at,
+              filled_at: order.filled_at,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async brokerCancelOrder(args: {
+    order_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Get order from DB
+    const { data: order, error } = await this.supabase
+      .from("telekash_broker_orders")
+      .select("*")
+      .eq("id", args.order_id)
+      .single();
+
+    if (error || !order) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Order not found", order_id: args.order_id },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Can only cancel pending/submitted orders
+    if (order.status !== "pending" && order.status !== "submitted") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: `Cannot cancel order in '${order.status}' status`,
+                order_id: order.id,
+                status: order.status,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Cancel on exchange
+    let cancelResult: { success: boolean; error?: string } = {
+      success: true,
+    };
+    if (order.exchange_order_id) {
+      cancelResult = await this.broker.cancelOrder(
+        order.exchange_order_id,
+        order.routed_to,
+      );
+    }
+
+    // Update DB
+    await this.supabase
+      .from("telekash_broker_orders")
+      .update({
+        status: cancelResult.success ? "cancelled" : order.status,
+        cancelled_at: cancelResult.success ? new Date().toISOString() : null,
+        error_message: cancelResult.error || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", order.id);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              cancelled: cancelResult.success,
+              order_id: order.id,
+              exchange_order_id: order.exchange_order_id,
+              market_title: order.market_title,
+              ...(cancelResult.error ? { error: cancelResult.error } : {}),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error("[TeleKash MCP] Prediction Oracle running on stdio");
+    const exchanges = this.broker.getConnectedExchanges();
+    console.error(
+      `[TeleKash MCP] Prediction Oracle running on stdio | Broker: ${exchanges.length > 0 ? exchanges.join(", ") : "no exchange credentials"}`,
+    );
   }
 }
 
