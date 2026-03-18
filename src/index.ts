@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (live):
+ * Oracle Tools (12 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -17,8 +17,11 @@
  * - get_trending: Markets with biggest probability swings (momentum detection)
  * - compare_sources: Cross-source odds comparison (Kalshi vs Polymarket)
  * - detect_arbitrage: Cross-source arbitrage detection with buy/sell signals
+ * - get_signal: Structured TPF signal (probability + confidence + sentiment + noise + verdict)
+ * - track_prediction: Record a prediction for performance tracking
+ * - get_performance: Agent accuracy metrics (Brier score, calibration, edge)
  *
- * @version 0.5.0
+ * @version 0.6.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
  */
 
@@ -362,6 +365,76 @@ Use this as the single entry point when an agent needs to make a trade decision.
       required: [],
     },
   },
+  {
+    name: "track_prediction",
+    description: `Record a prediction for performance tracking. Agents can log their predictions and later check accuracy via get_performance.
+
+Records: which market, predicted outcome (YES/NO), predicted probability, and confidence level. When the market resolves, your Brier score and calibration are computed automatically.
+
+Use this to build a track record. Agents with verified accuracy get higher trust scores.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        market_id: {
+          type: "string",
+          description: "The market UUID or external_id",
+        },
+        agent_id: {
+          type: "string",
+          description:
+            "Your agent identifier (any string — use consistently across predictions)",
+        },
+        predicted_outcome: {
+          type: "string",
+          enum: ["YES", "NO"],
+          description: "Your predicted outcome",
+        },
+        predicted_probability: {
+          type: "number",
+          description:
+            "Your estimated probability (0.0-1.0) that YES wins. Required for Brier score.",
+        },
+        reasoning: {
+          type: "string",
+          description: "Brief reasoning for the prediction (optional)",
+        },
+      },
+      required: [
+        "market_id",
+        "agent_id",
+        "predicted_outcome",
+        "predicted_probability",
+      ],
+    },
+  },
+  {
+    name: "get_performance",
+    description: `Get prediction performance metrics for an agent. Shows accuracy, Brier score, calibration, and prediction history.
+
+Returns:
+- Total predictions and resolution rate
+- Accuracy (% correct)
+- Brier score (0 = perfect, 1 = worst — lower is better)
+- Calibration curve (predicted probability vs actual outcome rate)
+- Recent predictions with outcomes
+
+Use this to evaluate an agent's forecasting ability or track your own improvement over time.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "The agent identifier to check performance for",
+        },
+        limit: {
+          type: "number",
+          description:
+            "Number of recent predictions to return (default: 20, max: 100)",
+        },
+      },
+      required: ["agent_id"],
+    },
+  },
   // ===========================================
   // AGENT TRADING TOOLS — Coming soon (pool infrastructure built, awaiting liquidity)
   // Uncomment when agent pools are funded and active
@@ -581,6 +654,20 @@ class TeleKashMCPServer {
           case "get_signal":
             return await this.getSignal(
               args as { market_id?: string; query?: string },
+            );
+          case "track_prediction":
+            return await this.trackPrediction(
+              args as {
+                market_id: string;
+                agent_id: string;
+                predicted_outcome: string;
+                predicted_probability: number;
+                reasoning?: string;
+              },
+            );
+          case "get_performance":
+            return await this.getPerformance(
+              args as { agent_id: string; limit?: number },
             );
           // Agent Trading Tools — gated until pools are funded
           // case "get_pool_status":
@@ -2321,6 +2408,424 @@ class TeleKashMCPServer {
         {
           type: "text",
           text: JSON.stringify(tpf, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // AGENT PERFORMANCE TRACKING
+  // ===========================================
+
+  private async trackPrediction(args: {
+    market_id: string;
+    agent_id: string;
+    predicted_outcome: string;
+    predicted_probability: number;
+    reasoning?: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const {
+      market_id,
+      agent_id,
+      predicted_outcome,
+      predicted_probability,
+      reasoning,
+    } = args;
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Validate probability
+    if (predicted_probability < 0 || predicted_probability > 1) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "predicted_probability must be between 0.0 and 1.0",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Find market
+    const { data: market } = await this.supabase
+      .from("telekash_markets")
+      .select("id, title, source, status, external_odds, resolved_outcome")
+      .or(`id.eq.${market_id},external_id.eq.${market_id}`)
+      .single();
+
+    if (!market) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Market not found", market_id },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Check for duplicate prediction
+    const { data: existing } = await this.supabase
+      .from("telekash_agent_predictions")
+      .select("id")
+      .eq("agent_id", agent_id)
+      .eq("market_id", market.id)
+      .limit(1)
+      .single();
+
+    if (existing) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Already predicted on this market",
+                prediction_id: existing.id,
+                _note:
+                  "Each agent gets one prediction per market. This prevents gaming accuracy metrics.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Record the prediction
+    const currentYesProb =
+      (market.external_odds as Record<string, number>)?.yes || 0.5;
+
+    const { data: prediction, error } = await this.supabase
+      .from("telekash_agent_predictions")
+      .insert({
+        agent_id,
+        market_id: market.id,
+        predicted_outcome: predicted_outcome.toUpperCase(),
+        predicted_probability,
+        market_probability_at_prediction: currentYesProb,
+        reasoning: reasoning || null,
+        status: market.status === "resolved" ? "resolved" : "pending",
+        is_correct:
+          market.status === "resolved"
+            ? market.resolved_outcome?.toUpperCase() ===
+              predicted_outcome.toUpperCase()
+            : null,
+      })
+      .select("id, created_at")
+      .single();
+
+    if (error) {
+      // Table might not exist yet — create it
+      if (error.code === "42P01") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: "Agent predictions table not yet created",
+                  _note:
+                    "Run the telekash_agent_predictions migration first. This table stores agent prediction history for performance tracking.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to record prediction", details: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              success: true,
+              prediction: {
+                id: prediction.id,
+                agent_id,
+                market: market.title,
+                market_id: market.id,
+                predicted_outcome: predicted_outcome.toUpperCase(),
+                predicted_probability,
+                market_probability_at_prediction: Math.round(
+                  currentYesProb * 100,
+                ),
+                edge: parseFloat(
+                  (
+                    Math.abs(predicted_probability - currentYesProb) * 100
+                  ).toFixed(1),
+                ),
+                recorded_at: prediction.created_at,
+              },
+              _note:
+                "Prediction recorded. Check accuracy after market resolves with get_performance.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async getPerformance(args: {
+    agent_id: string;
+    limit?: number;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const { agent_id, limit = 20 } = args;
+    const effectiveLimit = Math.min(Math.max(1, limit), 100);
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Get all predictions for this agent
+    const { data: predictions, error } = await this.supabase
+      .from("telekash_agent_predictions")
+      .select(
+        "id, market_id, predicted_outcome, predicted_probability, market_probability_at_prediction, is_correct, status, reasoning, created_at",
+      )
+      .eq("agent_id", agent_id)
+      .order("created_at", { ascending: false })
+      .limit(effectiveLimit);
+
+    if (error) {
+      if (error.code === "42P01") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: "Agent predictions table not yet created",
+                  _note: "Run the telekash_agent_predictions migration first.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to fetch predictions", details: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    if (!predictions || predictions.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                agent_id,
+                total_predictions: 0,
+                _note:
+                  "No predictions found. Use track_prediction to record predictions.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Calculate metrics
+    const total = predictions.length;
+    const resolved = predictions.filter(
+      (p: Record<string, unknown>) => p.status === "resolved",
+    );
+    const pending = total - resolved.length;
+    const correct = resolved.filter(
+      (p: Record<string, unknown>) => p.is_correct === true,
+    );
+    const accuracy =
+      resolved.length > 0 ? correct.length / resolved.length : null;
+
+    // Brier score (only for resolved predictions)
+    let brierScore: number | null = null;
+    if (resolved.length > 0) {
+      let brierSum = 0;
+      for (const p of resolved as Record<string, unknown>[]) {
+        const prob = p.predicted_probability as number;
+        const outcome = p.is_correct ? 1 : 0;
+        // Brier score: mean squared error of probability forecasts
+        // If predicted YES at 0.8 and it was YES → (0.8 - 1)^2 = 0.04 (good)
+        // If predicted YES at 0.8 and it was NO → (0.8 - 0)^2 = 0.64 (bad)
+        const forecastForOutcome =
+          (p.predicted_outcome as string) === "YES" ? prob : 1 - prob;
+        brierSum += Math.pow(forecastForOutcome - outcome, 2);
+      }
+      brierScore = parseFloat((brierSum / resolved.length).toFixed(4));
+    }
+
+    // Calibration buckets (0-10%, 10-20%, ..., 90-100%)
+    const calibrationBuckets: Record<
+      string,
+      { predictions: number; correct: number; avg_probability: number }
+    > = {};
+    for (const p of resolved as Record<string, unknown>[]) {
+      const prob = p.predicted_probability as number;
+      const bucketKey = `${Math.floor(prob * 10) * 10}-${Math.floor(prob * 10) * 10 + 10}%`;
+      if (!calibrationBuckets[bucketKey]) {
+        calibrationBuckets[bucketKey] = {
+          predictions: 0,
+          correct: 0,
+          avg_probability: 0,
+        };
+      }
+      calibrationBuckets[bucketKey].predictions++;
+      if (p.is_correct) calibrationBuckets[bucketKey].correct++;
+      calibrationBuckets[bucketKey].avg_probability += prob;
+    }
+    // Finalize averages
+    for (const bucket of Object.values(calibrationBuckets)) {
+      bucket.avg_probability = parseFloat(
+        (bucket.avg_probability / bucket.predictions).toFixed(3),
+      );
+    }
+
+    // Edge analysis — were predictions better than market consensus?
+    let avgEdge = 0;
+    let edgeWins = 0;
+    for (const p of resolved as Record<string, unknown>[]) {
+      const marketProb = p.market_probability_at_prediction as number;
+      const predictedProb = p.predicted_probability as number;
+      const edge = Math.abs(predictedProb - marketProb);
+      avgEdge += edge;
+      // Did the agent's divergence from market add value?
+      if (p.is_correct && predictedProb > marketProb) edgeWins++;
+      if (!p.is_correct && predictedProb < marketProb) edgeWins++;
+    }
+    avgEdge =
+      resolved.length > 0
+        ? parseFloat((avgEdge / resolved.length).toFixed(4))
+        : 0;
+
+    // Get market titles for recent predictions
+    const marketIds = predictions
+      .slice(0, 10)
+      .map((p: Record<string, unknown>) => p.market_id);
+    const { data: markets } = await this.supabase
+      .from("telekash_markets")
+      .select("id, title")
+      .in("id", marketIds);
+
+    const marketTitleMap = new Map(
+      (markets || []).map((m: Record<string, unknown>) => [m.id, m.title]),
+    );
+
+    const recentPredictions = predictions
+      .slice(0, 10)
+      .map((p: Record<string, unknown>) => ({
+        market: marketTitleMap.get(p.market_id as string) || p.market_id,
+        predicted: `${p.predicted_outcome} @ ${Math.round((p.predicted_probability as number) * 100)}%`,
+        market_was: `${Math.round((p.market_probability_at_prediction as number) * 100)}% YES`,
+        status: p.status,
+        correct: p.is_correct,
+        date: p.created_at,
+      }));
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              agent_id,
+              summary: {
+                total_predictions: total,
+                resolved: resolved.length,
+                pending,
+                correct: correct.length,
+                accuracy:
+                  accuracy !== null
+                    ? parseFloat((accuracy * 100).toFixed(1)) + "%"
+                    : "N/A (no resolved predictions)",
+                brier_score: brierScore,
+                brier_interpretation:
+                  brierScore !== null
+                    ? brierScore < 0.1
+                      ? "Excellent — top-tier forecaster"
+                      : brierScore < 0.2
+                        ? "Good — better than market average"
+                        : brierScore < 0.3
+                          ? "Fair — room for improvement"
+                          : "Poor — worse than coin flip"
+                    : null,
+              },
+              edge_analysis: {
+                avg_edge_vs_market:
+                  parseFloat((avgEdge * 100).toFixed(1)) + "%",
+                edge_win_rate:
+                  resolved.length > 0
+                    ? parseFloat(
+                        ((edgeWins / resolved.length) * 100).toFixed(1),
+                      ) + "%"
+                    : "N/A",
+                _note:
+                  "Edge measures how much your predictions diverged from market consensus. Edge win rate shows if that divergence added value.",
+              },
+              calibration: calibrationBuckets,
+              recent_predictions: recentPredictions,
+            },
+            null,
+            2,
+          ),
         },
       ],
     };
