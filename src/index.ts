@@ -120,6 +120,48 @@ const TIER_CONFIGS: Record<Tier, TierConfig> = {
   },
 };
 
+// Jurisdictional mapping — source to regulatory classification
+const SOURCE_JURISDICTION: Record<
+  string,
+  { jurisdiction: string; regulatory_status: string; country: string }
+> = {
+  kalshi: {
+    jurisdiction: "US-regulated",
+    regulatory_status: "CFTC-regulated designated contract market (DCM)",
+    country: "US",
+  },
+  polymarket: {
+    jurisdiction: "international",
+    regulatory_status: "Offshore, unregulated in most jurisdictions",
+    country: "International",
+  },
+  metaculus: {
+    jurisdiction: "forecasting",
+    regulatory_status:
+      "Forecasting platform — not gambling, immune to gambling regulation",
+    country: "US",
+  },
+  agent: {
+    jurisdiction: "unregulated",
+    regulatory_status: "Agent-created market — no regulatory oversight",
+    country: "N/A",
+  },
+  demo: {
+    jurisdiction: "demo",
+    regulatory_status: "Demo data — not real markets",
+    country: "N/A",
+  },
+};
+
+// Jurisdiction filter → source mapping
+const JURISDICTION_SOURCES: Record<string, string[]> = {
+  "US-regulated": ["kalshi"],
+  international: ["polymarket"],
+  forecasting: ["metaculus"],
+  unregulated: ["agent"],
+  all: [], // empty = no filter
+};
+
 // Tools that require specific tiers (used for error messages)
 const TIER_REQUIRED: Record<string, Tier> = {
   compare_sources: "calibration",
@@ -254,6 +296,12 @@ Example queries:
           type: "string",
           enum: ["all", "kalshi", "polymarket", "metaculus"],
           description: "Filter by data source (default: all)",
+        },
+        jurisdiction: {
+          type: "string",
+          enum: ["all", "US-regulated", "international", "forecasting"],
+          description:
+            "Filter by regulatory jurisdiction. US-regulated = Kalshi (CFTC-regulated), international = Polymarket, forecasting = Metaculus (not gambling). Default: all.",
         },
       },
       required: [],
@@ -1165,6 +1213,7 @@ class TeleKashMCPServer {
                   sort_by?: string;
                   limit?: number;
                   source?: string;
+                  jurisdiction?: string;
                 },
               ),
             );
@@ -1423,7 +1472,16 @@ class TeleKashMCPServer {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ ...result, confidence }, null, 2),
+          text: JSON.stringify(
+            {
+              ...result,
+              confidence,
+              jurisdiction:
+                SOURCE_JURISDICTION[market.source] || SOURCE_JURISDICTION.demo,
+            },
+            null,
+            2,
+          ),
         },
       ],
     };
@@ -1434,13 +1492,24 @@ class TeleKashMCPServer {
     sort_by?: string;
     limit?: number;
     source?: string;
+    jurisdiction?: string;
   }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
     const {
       category = "all",
       sort_by = "volume",
       limit = 10,
       source = "all",
+      jurisdiction = "all",
     } = args;
+
+    // Resolve jurisdiction to source filter
+    let effectiveSource = source;
+    if (jurisdiction !== "all" && source === "all") {
+      const jSources = JURISDICTION_SOURCES[jurisdiction];
+      if (jSources && jSources.length === 1) {
+        effectiveSource = jSources[0];
+      }
+    }
 
     const effectiveLimit = Math.min(Math.max(1, limit), 50);
 
@@ -1503,8 +1572,8 @@ class TeleKashMCPServer {
       query = query.eq("category", category);
     }
 
-    if (source !== "all") {
-      query = query.eq("source", source);
+    if (effectiveSource !== "all") {
+      query = query.eq("source", effectiveSource);
     }
 
     // Sort
@@ -1530,19 +1599,25 @@ class TeleKashMCPServer {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const markets: MarketListItem[] = (data || []).map((m: any) => ({
-      id: m.id,
-      title: m.title,
-      category: m.category,
-      source: m.source,
-      yes_probability: Math.round((m.external_odds?.yes || 0.5) * 100),
-      volume_24h:
-        (m.raw_data?.volume_24h as number) ||
-        (m.raw_data?.volume as number) ||
-        0,
-      closes_at: m.closes_at,
-      status: m.status,
-    }));
+    const markets = (data || []).map((m: any) => {
+      const jurisdictionInfo =
+        SOURCE_JURISDICTION[m.source] || SOURCE_JURISDICTION.demo;
+      return {
+        id: m.id,
+        title: m.title,
+        category: m.category,
+        source: m.source,
+        jurisdiction: jurisdictionInfo.jurisdiction,
+        regulatory_status: jurisdictionInfo.regulatory_status,
+        yes_probability: Math.round((m.external_odds?.yes || 0.5) * 100),
+        volume_24h:
+          (m.raw_data?.volume_24h as number) ||
+          (m.raw_data?.volume as number) ||
+          0,
+        closes_at: m.closes_at,
+        status: m.status,
+      };
+    });
 
     return {
       content: [
@@ -1552,7 +1627,12 @@ class TeleKashMCPServer {
             {
               markets,
               total: markets.length,
-              filters: { category, sort_by, source },
+              filters: {
+                category,
+                sort_by,
+                source: effectiveSource,
+                jurisdiction,
+              },
             },
             null,
             2,
