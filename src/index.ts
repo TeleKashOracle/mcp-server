@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (13 live):
+ * Oracle Tools (14 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -21,6 +21,7 @@
  * - track_prediction: Record a prediction for performance tracking
  * - get_performance: Agent accuracy metrics (Brier score, calibration, edge)
  * - get_divergences: Consensus divergence detection across all sources
+ * - get_edge: Capital efficiency — Kelly Criterion optimal position sizing
  *
  * @version 0.6.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
@@ -470,6 +471,50 @@ These are the markets where alpha exists. When sources converge, the edge disapp
       required: [],
     },
   },
+  {
+    name: "get_edge",
+    description: `Capital efficiency analysis — find markets with the best risk/reward for a given bankroll.
+
+Uses Kelly Criterion to compute optimal position sizes and expected value. Returns markets ranked by edge (expected profit per dollar risked).
+
+For each market:
+- Edge = your estimated probability minus market probability
+- Kelly fraction = optimal % of bankroll to allocate
+- Expected value per dollar risked
+- Risk classification (conservative/moderate/aggressive)
+
+Use this when an agent has limited capital and needs to maximize expected returns. Pairs with get_signal for probability estimates and track_prediction for accuracy tracking.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        bankroll: {
+          type: "number",
+          description:
+            "Total capital available for allocation (in dollars, default: 1000)",
+        },
+        agent_id: {
+          type: "string",
+          description:
+            "Agent ID — uses your prediction history to estimate your edge (optional but recommended)",
+        },
+        category: {
+          type: "string",
+          description: "Filter by category",
+        },
+        min_confidence: {
+          type: "string",
+          description:
+            "Minimum confidence grade to include (HIGH, MEDIUM, LOW — default: MEDIUM)",
+        },
+        limit: {
+          type: "number",
+          description:
+            "Number of opportunities to return (default: 10, max: 30)",
+        },
+      },
+      required: [],
+    },
+  },
   // ===========================================
   // AGENT TRADING TOOLS — Coming soon (pool infrastructure built, awaiting liquidity)
   // Uncomment when agent pools are funded and active
@@ -709,6 +754,16 @@ class TeleKashMCPServer {
               args as {
                 min_spread?: number;
                 category?: string;
+                limit?: number;
+              },
+            );
+          case "get_edge":
+            return await this.getEdge(
+              args as {
+                bankroll?: number;
+                agent_id?: string;
+                category?: string;
+                min_confidence?: string;
                 limit?: number;
               },
             );
@@ -2451,6 +2506,227 @@ class TeleKashMCPServer {
         {
           type: "text",
           text: JSON.stringify(tpf, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ===========================================
+  // CAPITAL EFFICIENCY — Kelly Criterion + Edge Analysis
+  // ===========================================
+
+  private async getEdge(args: {
+    bankroll?: number;
+    agent_id?: string;
+    category?: string;
+    min_confidence?: string;
+    limit?: number;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const {
+      bankroll = 1000,
+      agent_id,
+      category,
+      min_confidence = "MEDIUM",
+      limit = 10,
+    } = args;
+    const effectiveLimit = Math.min(Math.max(1, limit), 30);
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Get agent's historical accuracy if available
+    let agentEdge = 0; // how much better/worse than market consensus
+    if (agent_id) {
+      const { data: predictions } = await this.supabase
+        .from("telekash_agent_predictions")
+        .select(
+          "predicted_probability, market_probability_at_prediction, is_correct",
+        )
+        .eq("agent_id", agent_id)
+        .eq("status", "resolved")
+        .limit(100);
+
+      if (predictions && predictions.length >= 5) {
+        // Calculate agent's calibration edge
+        let edgeSum = 0;
+        for (const p of predictions as Record<string, unknown>[]) {
+          const predicted = p.predicted_probability as number;
+          const market = p.market_probability_at_prediction as number;
+          const correct = p.is_correct as boolean;
+          // If agent was right AND diverged from market, that's positive edge
+          if (correct && Math.abs(predicted - market) > 0.05) {
+            edgeSum += Math.abs(predicted - market);
+          } else if (!correct && Math.abs(predicted - market) > 0.05) {
+            edgeSum -= Math.abs(predicted - market);
+          }
+        }
+        agentEdge = edgeSum / predictions.length;
+      }
+    }
+
+    // Get active markets with high confidence
+    let query = this.supabase
+      .from("telekash_markets")
+      .select("id, title, source, category, external_odds, raw_data, closes_at")
+      .eq("status", "active")
+      .order("raw_data->volume", { ascending: false })
+      .limit(200);
+
+    if (category && category !== "all") {
+      query = query.eq("category", category);
+    }
+
+    const { data: markets } = await query;
+    if (!markets || markets.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { opportunities: [], summary: { total: 0 } },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Score each market for capital efficiency
+    const opportunities: Array<{
+      market_id: string;
+      title: string;
+      source: string;
+      category: string;
+      yes_probability: number;
+      confidence_grade: string;
+      edge_pct: number;
+      kelly_fraction: number;
+      optimal_bet: number;
+      expected_value_per_dollar: number;
+      risk_classification: string;
+      days_to_close: number;
+      annualized_return_pct: number;
+    }> = [];
+
+    const confidenceThresholds: Record<string, number> = {
+      HIGH: 0.8,
+      MEDIUM: 0.5,
+      LOW: 0.3,
+    };
+    const minConfScore = confidenceThresholds[min_confidence] || 0.5;
+
+    for (const market of markets as Record<string, unknown>[]) {
+      const odds = market.external_odds as Record<string, number>;
+      const rawData = (market.raw_data as Record<string, unknown>) || {};
+      const yesProb = odds?.yes || 0.5;
+      const volume =
+        (rawData.volume_24h as number) || (rawData.volume as number) || 0;
+      const liquidity = (rawData.liquidity as number) || 0;
+
+      const confidence = computeConfidence({
+        volume,
+        liquidity,
+        yesProbability: Math.round(yesProb * 100),
+        closesAt: market.closes_at as string,
+      });
+
+      if (confidence.score < minConfScore) continue;
+
+      // Edge calculation
+      // For markets near 50%, the edge from probability conviction is small
+      // For markets with strong conviction (>70% or <30%), edge = distance from fair
+      const probConviction = Math.abs(yesProb - 0.5);
+      const edge = probConviction + agentEdge; // agent's historical edge adds
+
+      if (edge < 0.02) continue; // Skip markets with <2% edge
+
+      // Kelly Criterion: f* = (bp - q) / b
+      // where b = odds, p = estimated probability of winning, q = 1-p
+      // Simplified for binary: f* = 2*edge (capped at 0.25 = quarter-Kelly for safety)
+      const kellyFraction = Math.min(0.25, 2 * edge);
+      const optimalBet = parseFloat((bankroll * kellyFraction).toFixed(2));
+
+      // Expected value per dollar
+      const evPerDollar = parseFloat((edge * 2).toFixed(4)); // simplified EV
+
+      // Days to close
+      const closesAt = new Date(market.closes_at as string).getTime();
+      const daysToClose = Math.max(
+        0.1,
+        (closesAt - Date.now()) / (1000 * 60 * 60 * 24),
+      );
+
+      // Annualized return (edge / days * 365)
+      const annualizedReturn = parseFloat(
+        ((edge / daysToClose) * 365 * 100).toFixed(1),
+      );
+
+      // Risk classification
+      let riskClass: string;
+      if (kellyFraction > 0.15) riskClass = "aggressive";
+      else if (kellyFraction > 0.05) riskClass = "moderate";
+      else riskClass = "conservative";
+
+      opportunities.push({
+        market_id: market.id as string,
+        title: market.title as string,
+        source: market.source as string,
+        category: market.category as string,
+        yes_probability: Math.round(yesProb * 100),
+        confidence_grade: confidence.grade,
+        edge_pct: parseFloat((edge * 100).toFixed(1)),
+        kelly_fraction: parseFloat(kellyFraction.toFixed(4)),
+        optimal_bet: optimalBet,
+        expected_value_per_dollar: evPerDollar,
+        risk_classification: riskClass,
+        days_to_close: parseFloat(daysToClose.toFixed(1)),
+        annualized_return_pct: annualizedReturn,
+      });
+    }
+
+    // Sort by annualized return (best risk/reward considering time)
+    opportunities.sort(
+      (a, b) => b.annualized_return_pct - a.annualized_return_pct,
+    );
+    const results = opportunities.slice(0, effectiveLimit);
+
+    // Calculate total allocation
+    const totalAllocated = results.reduce((sum, o) => sum + o.optimal_bet, 0);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              opportunities: results,
+              portfolio_summary: {
+                bankroll,
+                total_allocated: parseFloat(totalAllocated.toFixed(2)),
+                reserve: parseFloat((bankroll - totalAllocated).toFixed(2)),
+                markets_analyzed: markets.length,
+                opportunities_found: opportunities.length,
+                returned: results.length,
+                agent_historical_edge: agent_id
+                  ? parseFloat((agentEdge * 100).toFixed(2)) + "%"
+                  : "N/A (provide agent_id for personalized edge)",
+                min_confidence_filter: min_confidence,
+              },
+              _note:
+                "Kelly fractions are capped at quarter-Kelly (25%) for safety. Optimal bet = bankroll × kelly_fraction. Annualized return assumes edge is realized over time-to-close. Use track_prediction to build accuracy history for better edge estimates.",
+            },
+            null,
+            2,
+          ),
         },
       ],
     };
