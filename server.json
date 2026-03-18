@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.telekash/mcp-server",
+  "description": "Prediction market probability oracle for AI agents. Query 480+ live markets from Kalshi (CFTC-regulated) & Polymarket. Real-time odds, AI sentiment analysis, trend history, momentum detection, and cross-source odds comparison. The only MCP that aggregates both regulated and unregulated prediction markets.",
+  "repository": {
+    "url": "https://github.com/benjoflo/mcp-server",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "telekash-mcp-server",
+      "version": "0.5.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Supabase project URL for TeleKash database",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "SUPABASE_URL"
+        },
+        {
+          "description": "Supabase anonymous key for read access to prediction markets",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "SUPABASE_ANON_KEY"
+        }
+      ]
+    }
+  ]
+}
