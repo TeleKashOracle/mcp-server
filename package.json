@@ -1,7 +1,7 @@
 {
   "name": "telekash-mcp-server",
   "version": "0.6.0",
-  "description": "Prediction market probability oracle for AI agents. 12 tools across 500+ live markets from Kalshi, Polymarket & Metaculus. Structured TPF signals, cross-source arbitrage, noise detection, agent performance tracking. The probability oracle for the agent economy.",
+  "description": "Prediction market probability oracle for AI agents. 13 tools across 500+ live markets from Kalshi, Polymarket & Metaculus. Structured TPF signals, cross-source arbitrage, noise detection, agent performance tracking with Brier scores. The probability oracle for the agent economy.",
   "main": "dist/index.js",
   "bin": {
     "telekash-mcp": "dist/index.js"
@@ -38,6 +38,7 @@
   "license": "MIT",
   "files": [
     "dist",
+    "examples",
     "README.md",
     "LICENSE"
   ],
