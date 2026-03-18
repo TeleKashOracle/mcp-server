@@ -1,0 +1,140 @@
+{
+  "$schema": "https://raw.githubusercontent.com/google/A2A/main/specification/json/a2a.schema.json",
+  "name": "TeleKash Prediction Oracle",
+  "description": "Probability oracle for the agent economy. 20 tools across 500+ live prediction markets from Kalshi (CFTC-regulated), Polymarket, and Metaculus. Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
+  "url": "https://github.com/TeleKashOracle/mcp-server",
+  "version": "0.7.0",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": true,
+    "stateTransitionHistory": false
+  },
+  "skills": [
+    {
+      "id": "prediction-intelligence",
+      "name": "Prediction Market Intelligence",
+      "description": "Real-time probabilities, sentiment, confidence scores, and historical trends across 500+ markets from 3 sources (Kalshi, Polymarket, Metaculus).",
+      "tags": [
+        "prediction-market",
+        "probability",
+        "odds",
+        "forecasting",
+        "sentiment"
+      ],
+      "examples": [
+        "What are the odds Trump wins 2028?",
+        "Show me crypto prediction markets",
+        "What's trending in politics predictions?"
+      ]
+    },
+    {
+      "id": "arbitrage-signals",
+      "name": "Cross-Source Arbitrage & Divergence Detection",
+      "description": "Detects pricing discrepancies between Kalshi, Polymarket, and Metaculus. Finds where sources disagree most — that's where alpha lives. $40M+ extracted from prediction market mispricings annually.",
+      "tags": ["arbitrage", "trading-signal", "mispricing", "divergence"],
+      "examples": [
+        "Find arbitrage opportunities across prediction markets",
+        "Where do Kalshi and Polymarket disagree most?",
+        "Show me markets with strong consensus divergence"
+      ]
+    },
+    {
+      "id": "structured-signals",
+      "name": "TeleKash Probability Format (TPF) Signals",
+      "description": "Structured pre-computed trading signals combining probability, confidence, sentiment, noise filter, and cross-source data into one actionable verdict (STRONG_BUY to STRONG_SELL).",
+      "tags": [
+        "trading-signal",
+        "tpf",
+        "decision-support",
+        "automated-trading"
+      ],
+      "examples": [
+        "Give me a trading signal for Bitcoin prediction markets",
+        "Should I buy YES on the Fed rate cut market?",
+        "What's the signal quality on this market — signal or noise?"
+      ]
+    },
+    {
+      "id": "capital-efficiency",
+      "name": "Kelly Criterion Capital Efficiency",
+      "description": "Optimal position sizing using Kelly Criterion. Computes edge, optimal bankroll allocation, expected value, and risk classification for prediction market positions.",
+      "tags": [
+        "kelly-criterion",
+        "position-sizing",
+        "risk-management",
+        "capital-allocation"
+      ],
+      "examples": [
+        "How much of my $1000 bankroll should I allocate to this market?",
+        "What's my edge vs the market on Bitcoin predictions?",
+        "Find the best risk/reward opportunities for my portfolio"
+      ]
+    },
+    {
+      "id": "performance-tracking",
+      "name": "Agent Prediction Performance",
+      "description": "Track prediction accuracy with Brier scores, calibration curves, and edge-vs-market analysis. Build a verifiable prediction track record.",
+      "tags": ["brier-score", "calibration", "accuracy", "track-record"],
+      "examples": [
+        "Track my prediction: YES on Bitcoin >100k at 75%",
+        "How accurate are my predictions?",
+        "What's my Brier score?"
+      ]
+    },
+    {
+      "id": "webhook-alerts",
+      "name": "Event-Driven Webhook Alerts",
+      "description": "Register alerts for market events. Agent sleeps until TeleKash wakes it up. Conditions: probability crosses, mispricing detected, volume spike, resolution, divergence.",
+      "tags": ["webhook", "alerts", "event-driven", "notifications"],
+      "examples": [
+        "Alert me when Bitcoin YES crosses 70%",
+        "Notify me when any Kalshi/Polymarket gap exceeds 5%",
+        "Tell me when this market resolves"
+      ]
+    },
+    {
+      "id": "compliance-filter",
+      "name": "Jurisdictional Compliance Filtering",
+      "description": "Filter markets by regulatory jurisdiction. US-regulated (Kalshi, CFTC), international (Polymarket), or forecasting (Metaculus, immune to gambling regulation).",
+      "tags": ["compliance", "regulation", "cftc", "jurisdiction"],
+      "examples": [
+        "Show me only CFTC-regulated prediction markets",
+        "List international markets only",
+        "What forecasting markets are available?"
+      ]
+    },
+    {
+      "id": "market-creation",
+      "name": "Custom Market Creation",
+      "description": "Create agent-powered prediction markets. Binary YES/NO questions that resolve on a specified date. Other agents can query, predict on, and trade these markets.",
+      "tags": ["market-creation", "custom-markets", "agent-markets"],
+      "examples": [
+        "Create a market: Will ETH flip BTC by 2027?",
+        "Set up a prediction market for the next election"
+      ]
+    }
+  ],
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "provider": {
+    "organization": "TeleKash",
+    "url": "https://t.me/TeleKashBot"
+  },
+  "authentication": {
+    "schemes": [
+      {
+        "scheme": "apiKey",
+        "in": "environment",
+        "name": "TELEKASH_API_KEY"
+      }
+    ]
+  },
+  "protocols": {
+    "mcp": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["telekash-mcp-server"],
+      "npmPackage": "telekash-mcp-server"
+    }
+  }
+}
