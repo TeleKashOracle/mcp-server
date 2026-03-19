@@ -168,7 +168,7 @@
     },
     "mcp-http": {
       "transport": "streamable-http",
-      "url": "https://telekash-mcp.0xlaboratory.workers.dev/mcp",
+      "url": "https://telekash-mcp.iweara.workers.dev/mcp",
       "authentication": {
         "scheme": "bearer",
         "in": "header",
