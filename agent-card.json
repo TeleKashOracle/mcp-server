@@ -3,7 +3,7 @@
   "name": "TeleKash Prediction Oracle",
   "description": "Probability oracle + trade broker for the agent economy. 26 tools across 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Multi-source resolution oracle with cross-source verification (0.70-0.99 confidence). Smart trade routing with 1% commission OR dual-sided native pools (trade alongside Telegram users). Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
   "url": "https://github.com/TeleKashOracle/mcp-server",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "capabilities": {
     "streaming": false,
     "pushNotifications": true,
@@ -168,7 +168,7 @@
     },
     "mcp-http": {
       "transport": "streamable-http",
-      "url": "https://telekash-mcp.iweara.workers.dev/mcp",
+      "url": "https://telekash-mcp.telekash.workers.dev/mcp",
       "authentication": {
         "scheme": "bearer",
         "in": "header",

@@ -11,7 +11,7 @@
     {
       "registryType": "npm",
       "identifier": "telekash-mcp-server",
-      "version": "0.6.1",
+      "version": "0.8.1",
       "transport": {
         "type": "stdio"
       },
