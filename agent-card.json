@@ -160,11 +160,20 @@
     ]
   },
   "protocols": {
-    "mcp": {
+    "mcp-stdio": {
       "transport": "stdio",
       "command": "npx",
       "args": ["telekash-mcp-server"],
       "npmPackage": "telekash-mcp-server"
+    },
+    "mcp-http": {
+      "transport": "streamable-http",
+      "url": "https://telekash-mcp.0xlaboratory.workers.dev/mcp",
+      "authentication": {
+        "scheme": "bearer",
+        "in": "header",
+        "name": "Authorization"
+      }
     }
   }
 }

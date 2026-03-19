@@ -1,0 +1,18 @@
+{
+  "name": "telekash-mcp-worker",
+  "version": "0.8.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "typescript": "^5.3.0",
+    "wrangler": "^3.99.0"
+  }
+}
