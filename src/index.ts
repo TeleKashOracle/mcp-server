@@ -1628,7 +1628,7 @@ class TeleKashMCPServer {
             TIER_CONFIGS,
           );
           try {
-            x402Verified = verifyPayment(proof, toolPrice);
+            x402Verified = await verifyPayment(proof, toolPrice);
             console.error(
               `[TeleKash x402] Paid access: tool=${name} tx=${proof.tx_hash.substring(0, 16)}... price=$${toolPrice}`,
             );
@@ -1769,7 +1769,9 @@ class TeleKashMCPServer {
                       : TIER_CONFIGS[this.tier].price_per_query,
                     session_total: this.sessionCost,
                     currency: "USD",
-                    payment_method: x402Verified ? "x402_usdc" : "api_key",
+                    payment_method: x402Verified
+                      ? `${x402Verified.rail}`
+                      : "api_key",
                   },
                   ...(x402Verified
                     ? {
@@ -1777,6 +1779,7 @@ class TeleKashMCPServer {
                           tx_hash: x402Verified.tx_hash,
                           network: x402Verified.network,
                           amount_usd: x402Verified.amount_usd,
+                          rail: x402Verified.rail,
                         },
                       }
                     : {}),
