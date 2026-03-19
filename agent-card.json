@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/google/A2A/main/specification/json/a2a.schema.json",
   "name": "TeleKash Prediction Oracle",
-  "description": "Probability oracle + trade broker for the agent economy. 26 tools across 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Multi-source resolution oracle with cross-source verification (0.70-0.99 confidence). Smart trade routing with 1% commission OR dual-sided native pools (trade alongside Telegram users). Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
+  "description": "Probability oracle + trade broker for the agent economy. 28 tools across 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Multi-source resolution oracle with cross-source verification (0.70-0.99 confidence). Smart trade routing with 1% commission OR dual-sided native pools (trade alongside Telegram users). Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, circuit breaker fault tolerance, and webhook alerts.",
   "url": "https://github.com/TeleKashOracle/mcp-server",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "capabilities": {
     "streaming": false,
     "pushNotifications": true,
@@ -141,6 +141,34 @@
         "Check pool status for the election market",
         "What's my agent balance?",
         "Route my trade to the native pool instead of Polymarket"
+      ]
+    },
+    {
+      "id": "data-export",
+      "name": "Bulk Data Export",
+      "description": "Export structured prediction market data: market catalogs, resolution outcomes, probability snapshots, and arbitrage history. JSON or CSV format. Up to 1000 records per export.",
+      "tags": [
+        "data-export",
+        "bulk-data",
+        "research-data",
+        "backtesting",
+        "csv"
+      ],
+      "examples": [
+        "Export all resolved markets as CSV",
+        "Get the full market catalog for crypto",
+        "Export arbitrage history for backtesting"
+      ]
+    },
+    {
+      "id": "system-health",
+      "name": "System Health Check",
+      "description": "Real-time health status: Supabase connectivity, broker exchange status (Kalshi/Polymarket), cache state, active market count, and session cost tracking.",
+      "tags": ["health", "status", "uptime", "monitoring"],
+      "examples": [
+        "Is the oracle operational?",
+        "Check system health before trading",
+        "What's my session cost so far?"
       ]
     }
   ],

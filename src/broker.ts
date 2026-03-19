@@ -13,6 +13,7 @@
  */
 
 import { createHmac, createSign } from "crypto";
+import { CircuitBreaker } from "./circuit-breaker.js";
 
 // ============================================
 // TYPES
@@ -460,6 +461,8 @@ export class TeleKashBroker {
   private kalshi: KalshiClient | null = null;
   private polymarket: PolymarketClient | null = null;
   private credentials: ExchangeCredentials;
+  private kalshiCircuit = new CircuitBreaker("kalshi");
+  private polymarketCircuit = new CircuitBreaker("polymarket");
 
   constructor() {
     this.credentials = {
@@ -499,6 +502,104 @@ export class TeleKashBroker {
   }
 
   /**
+   * Validate exchange credentials on boot.
+   * Makes a lightweight read-only API call to verify auth works.
+   * Logs status — does NOT throw on failure (graceful degradation).
+   */
+  async validateCredentials(): Promise<{
+    kalshi: { connected: boolean; error?: string };
+    polymarket: { connected: boolean; error?: string };
+  }> {
+    const status = {
+      kalshi: { connected: false, error: undefined as string | undefined },
+      polymarket: { connected: false, error: undefined as string | undefined },
+    };
+
+    if (this.kalshi) {
+      try {
+        await this.kalshi.getOrderbook("TEMP-TEST");
+        status.kalshi.connected = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // 404 = ticker not found = auth works, market doesn't exist
+        if (msg.includes("404")) {
+          status.kalshi.connected = true;
+        } else {
+          status.kalshi.error = msg;
+          console.error(
+            `[TeleKash Broker] Kalshi credential check failed: ${msg}`,
+          );
+        }
+      }
+    }
+
+    if (this.polymarket) {
+      try {
+        // Polymarket public endpoint to verify connectivity
+        const response = await fetch("https://clob.polymarket.com/time");
+        if (response.ok) {
+          status.polymarket.connected = true;
+        } else {
+          status.polymarket.error = `HTTP ${response.status}`;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        status.polymarket.error = msg;
+        console.error(
+          `[TeleKash Broker] Polymarket connectivity check failed: ${msg}`,
+        );
+      }
+    }
+
+    const connectedCount = [
+      status.kalshi.connected,
+      status.polymarket.connected,
+    ].filter(Boolean).length;
+    console.error(
+      `[TeleKash Broker] Credential validation: ${connectedCount}/2 exchanges verified`,
+    );
+
+    return status;
+  }
+
+  /**
+   * Retry a function with exponential backoff.
+   * Used for exchange API calls that may be rate-limited.
+   */
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    maxRetries: number = 3,
+    baseDelayMs: number = 500,
+  ): Promise<T> {
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const isRateLimit =
+          lastError.message.includes("429") ||
+          lastError.message.includes("rate");
+        const isServerError =
+          lastError.message.includes("500") ||
+          lastError.message.includes("503");
+
+        if (attempt < maxRetries && (isRateLimit || isServerError)) {
+          const delay =
+            baseDelayMs * Math.pow(2, attempt) + Math.random() * 200;
+          console.error(
+            `[TeleKash Broker] Retry ${attempt + 1}/${maxRetries} after ${Math.round(delay)}ms: ${lastError.message}`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        } else {
+          throw lastError;
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  /**
    * Check which exchanges are connected
    */
   getConnectedExchanges(): string[] {
@@ -506,6 +607,19 @@ export class TeleKashBroker {
     if (this.kalshi) connected.push("kalshi");
     if (this.polymarket) connected.push("polymarket");
     return connected;
+  }
+
+  /**
+   * Get circuit breaker status for all exchanges
+   */
+  getCircuitStatus(): Record<
+    string,
+    { state: string; failures: number; lastFailure: number | null }
+  > {
+    return {
+      kalshi: this.kalshiCircuit.getState(),
+      polymarket: this.polymarketCircuit.getState(),
+    };
   }
 
   /**
@@ -567,12 +681,16 @@ export class TeleKashBroker {
       routingReason = "source_match";
     }
 
-    // Execute on the chosen exchange
+    // Execute on the chosen exchange (wrapped in circuit breaker)
     try {
       if (routeTo === "kalshi" && this.kalshi) {
-        return await this.executeKalshi(order, market, routingReason);
+        return await this.kalshiCircuit.execute(() =>
+          this.executeKalshi(order, market, routingReason),
+        );
       } else if (routeTo === "polymarket" && this.polymarket) {
-        return await this.executePolymarket(order, market, routingReason);
+        return await this.polymarketCircuit.execute(() =>
+          this.executePolymarket(order, market, routingReason),
+        );
       } else {
         return {
           success: false,
@@ -611,13 +729,15 @@ export class TeleKashBroker {
         ? market.external_id
         : (market.raw_data?.ticker as string) || market.external_id;
 
-    const result = await this.kalshi.placeOrder({
-      ticker,
-      side: order.side,
-      amount_usd: order.amount_usd,
-      order_type: order.order_type,
-      limit_price: order.limit_price,
-    });
+    const result = await this.withRetry(() =>
+      this.kalshi!.placeOrder({
+        ticker,
+        side: order.side,
+        amount_usd: order.amount_usd,
+        order_type: order.order_type,
+        limit_price: order.limit_price,
+      }),
+    );
 
     const fillAmount = result.filled_count
       ? result.filled_count * (result.fill_price || order.limit_price || 0.5)
@@ -689,13 +809,15 @@ export class TeleKashBroker {
           (market.external_odds?.prices as number[])?.[1] ||
           0.5);
 
-    const result = await this.polymarket.placeOrder({
-      token_id: tokenId,
-      side: "BUY", // Buying YES or NO tokens
-      price,
-      size: order.amount_usd,
-      order_type: order.order_type === "limit" ? "GTC" : "FOK",
-    });
+    const result = await this.withRetry(() =>
+      this.polymarket!.placeOrder({
+        token_id: tokenId,
+        side: "BUY", // Buying YES or NO tokens
+        price,
+        size: order.amount_usd,
+        order_type: order.order_type === "limit" ? "GTC" : "FOK",
+      }),
+    );
 
     const fillAmount = result.filled_size || order.amount_usd;
     const commission = fillAmount * 0.01;
@@ -722,7 +844,9 @@ export class TeleKashBroker {
   ): Promise<OrderStatus | null> {
     try {
       if (exchange === "kalshi" && this.kalshi) {
-        const result = await this.kalshi.getOrder(exchangeOrderId);
+        const result = await this.withRetry(() =>
+          this.kalshi!.getOrder(exchangeOrderId),
+        );
         return {
           order_id: exchangeOrderId,
           status: mapExchangeStatus(result.status),
@@ -735,7 +859,9 @@ export class TeleKashBroker {
           created_at: new Date().toISOString(),
         };
       } else if (exchange === "polymarket" && this.polymarket) {
-        const result = await this.polymarket.getOrder(exchangeOrderId);
+        const result = await this.withRetry(() =>
+          this.polymarket!.getOrder(exchangeOrderId),
+        );
         return {
           order_id: exchangeOrderId,
           status: mapExchangeStatus(result.status),

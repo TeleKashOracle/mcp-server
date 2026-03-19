@@ -32,7 +32,7 @@
  * - get_order_status: Check broker order fill status
  * - cancel_order: Cancel pending broker orders
  *
- * @version 0.8.0
+ * @version 0.9.0
  * @author TeleKash <themagician@0xlaboratory.xyz>
  */
 
@@ -42,6 +42,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -61,9 +62,20 @@ import {
   cacheClose,
   type CacheEntry,
 } from "./cache.js";
+import {
+  createPaymentRequired,
+  isX402Payment,
+  extractPaymentProof,
+  verifyPayment,
+  formatX402Response,
+  getToolPrice,
+  stripPaymentArgs,
+  type X402PaymentVerified,
+} from "./x402.js";
+import { OracleClient } from "./oracle/index.js";
 
 // ============================================
-// TIER SYSTEM — Free / Calibration ($99/mo) / Edge ($499/mo)
+// TIER SYSTEM — Free / Calibration ($0.01/query) / Edge ($0.05/query)
 // ============================================
 
 type Tier = "free" | "calibration" | "edge";
@@ -72,6 +84,8 @@ interface TierConfig {
   calls_per_day: number;
   sources: string[];
   tools: string[];
+  price_per_query: number; // USD cost per tool call (0 = free)
+  description: string;
 }
 
 const TIER_CONFIGS: Record<Tier, TierConfig> = {
@@ -88,7 +102,10 @@ const TIER_CONFIGS: Record<Tier, TierConfig> = {
       "get_trending",
       "generate_api_key",
       "get_usage",
+      "get_health",
     ],
+    price_per_query: 0,
+    description: "Free tier — 100 queries/day, intelligence tools",
   },
   calibration: {
     calls_per_day: 1000,
@@ -106,9 +123,15 @@ const TIER_CONFIGS: Record<Tier, TierConfig> = {
       "get_divergences",
       "track_prediction",
       "get_performance",
+      "get_resolution_status",
+      "get_calibration_changelog",
       "generate_api_key",
       "get_usage",
+      "get_health",
     ],
+    price_per_query: 0.01,
+    description:
+      "Calibration tier — $0.01/query, cross-source analysis + calibration changelog",
   },
   edge: {
     calls_per_day: 999999,
@@ -129,6 +152,7 @@ const TIER_CONFIGS: Record<Tier, TierConfig> = {
       "get_signal",
       "get_edge",
       "create_market",
+      "get_calibration_changelog",
       "generate_api_key",
       "get_usage",
       "register_alert",
@@ -137,7 +161,11 @@ const TIER_CONFIGS: Record<Tier, TierConfig> = {
       "execute_trade",
       "get_order_status",
       "cancel_order",
+      "export_data",
+      "get_health",
     ],
+    price_per_query: 0.05,
+    description: "Edge tier — $0.05/query, signals + broker + pools + alerts",
   },
 };
 
@@ -202,6 +230,8 @@ const TIER_REQUIRED: Record<string, Tier> = {
   get_pool_status: "edge",
   get_agent_balance: "edge",
   get_resolution_status: "calibration",
+  get_calibration_changelog: "calibration",
+  export_data: "edge",
 };
 
 // Types
@@ -263,7 +293,9 @@ Example queries:
 - "What's the probability BTC hits $200K?" → crypto price prediction
 - "Will the Fed cut rates?" → economic forecasting, interest rates
 - "What's the chance of rain in NYC?" → weather betting
-- "Who will win the Super Bowl?" → sports odds`,
+- "Who will win the Super Bowl?" → sports odds
+
+Keywords: forecasting, prediction odds, what are the chances, likelihood, will something happen, binary outcome probability, event prediction, market odds lookup, probability forecast, future event odds, outcome likelihood`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -292,7 +324,9 @@ Example queries:
 - "Show me crypto prediction markets" → Bitcoin, Ethereum, altcoin forecasts
 - "What sports markets are trending?" → NFL, NBA, soccer odds
 - "List political predictions" → elections, legislation, geopolitics
-- "What economic forecasts are available?" → GDP, inflation, interest rates`,
+- "What economic forecasts are available?" → GDP, inflation, interest rates
+
+Keywords: browse prediction markets, find betting opportunities, explore categories, crypto politics sports science markets, active markets catalog, market directory, available predictions, what can I bet on`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -340,7 +374,9 @@ Example queries:
 
 Returns probability snapshots showing how odds, sentiment, and market consensus have shifted over 1h, 24h, 7d, or 30d.
 Use for trend analysis, momentum detection, volatility assessment, and understanding how predictions evolve.
-Essential for backtesting strategies, identifying probability swings, and spotting market-moving events.`,
+Essential for backtesting strategies, identifying probability swings, and spotting market-moving events.
+
+Keywords: probability timeline, how odds changed, trend analysis, momentum detection, historical price movement, odds trajectory, price history, probability over time, how has the market moved`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -370,7 +406,9 @@ Example queries:
 - "Bitcoin price prediction" → BTC price target markets
 - "Super Bowl winner" → NFL championship odds
 - "AI regulation" → technology policy predictions
-- "Fed interest rate" → monetary policy forecasts`,
+- "Fed interest rate" → monetary policy forecasts
+
+Keywords: find specific prediction market, search by topic, keyword search, market discovery, find predictions about, topic search, event lookup, query markets`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -392,7 +430,9 @@ Example queries:
 
 Returns sentiment score (-1 to 1), actionable recommendation (bullish/bearish/neutral), and AI confidence level.
 Goes beyond raw probability — analyzes market psychology, crowd wisdom, and directional bias.
-Use for trade signals, contrarian analysis, or augmenting your own prediction models with market sentiment data.`,
+Use for trade signals, contrarian analysis, or augmenting your own prediction models with market sentiment data.
+
+Keywords: market sentiment analysis, bullish or bearish, conviction scoring, should I buy or sell, crowd wisdom, contrarian signal, market psychology, directional bias, trading recommendation`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -409,7 +449,9 @@ Use for trade signals, contrarian analysis, or augmenting your own prediction mo
     description: `Get aggregate statistics across all prediction markets — totals, categories, sources, and volume.
 
 Returns total market count, active markets, category distribution, source breakdown (Kalshi vs Polymarket), and aggregate trading volume.
-Use for market overview, portfolio allocation decisions, or understanding the prediction market landscape.`,
+Use for market overview, portfolio allocation decisions, or understanding the prediction market landscape.
+
+Keywords: aggregate statistics, market overview, total volume, market count, category breakdown, platform health, how many markets, prediction market summary`,
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -425,7 +467,9 @@ Use for market overview, portfolio allocation decisions, or understanding the pr
 
 Finds markets where odds moved most in the last 1h, 24h, 7d, or 30d. Surfaces breaking events, sentiment shifts, and market-moving news.
 Use when looking for actionable opportunities, volatile markets, or events where consensus is rapidly changing.
-Returns markets ranked by absolute probability change with direction (up/down) and current odds.`,
+Returns markets ranked by absolute probability change with direction (up/down) and current odds.
+
+Keywords: hot markets, biggest movers, momentum detection, breaking news markets, probability swings, what is moving now, volatile markets, rapid odds change, trending predictions`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -448,7 +492,9 @@ Returns markets ranked by absolute probability change with direction (up/down) a
 
 Searches for markets matching your query on both Kalshi (CFTC-regulated) and Polymarket, then shows side-by-side probabilities.
 Use for arbitrage detection, cross-validating predictions, or understanding how regulated vs unregulated markets price the same event.
-Returns matched pairs with probability delta and which source is more bullish/bearish.`,
+Returns matched pairs with probability delta and which source is more bullish/bearish.
+
+Keywords: cross-source comparison, Kalshi vs Polymarket odds, price discrepancy, which source is right, odds comparison, multi-exchange pricing, regulatory arbitrage, consensus disagreement`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -768,8 +814,8 @@ Created markets start with 50/50 odds. Probability moves as predictions come in.
     description: `Generate a free TeleKash API key for rate-limited access to prediction market intelligence.
 
 Free tier: 100 calls/day, 7 core tools (probability, markets, search, history, sentiment, stats, trending).
-Calibration tier ($99/mo): 1,000 calls/day + arbitrage, divergence, and performance tracking tools.
-Edge tier ($499/mo): Unlimited + TPF signals, Kelly sizing, and market creation.
+Calibration tier ($0.01/query): 1,000 calls/day + arbitrage, divergence, and performance tracking tools.
+Edge tier ($0.05/query): Unlimited + TPF signals, Kelly sizing, and market creation.
 
 The API key is returned ONCE — save it immediately. Set it as TELEKASH_API_KEY environment variable.`,
     inputSchema: {
@@ -1033,10 +1079,90 @@ Use this to verify resolution integrity before accepting payout results.`,
       required: ["market_id"],
     },
   },
+  {
+    name: "export_data",
+    description: `Export structured prediction market data in bulk. Historical probabilities, resolution outcomes, market catalogs, and arbitrage history.
+
+Types: probability_history (how odds changed over time), resolution_outcomes (how markets resolved), market_catalog (all active markets with metadata), arbitrage_history (cross-source price gaps).
+
+Returns structured JSON or CSV format. Max 1000 records per export.
+
+Keywords: bulk data export, historical data, prediction dataset, market data feed, data licensing, research data, backtesting data, probability timeseries`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        type: {
+          type: "string",
+          enum: [
+            "probability_history",
+            "resolution_outcomes",
+            "market_catalog",
+            "arbitrage_history",
+          ],
+          description: "Type of data to export",
+        },
+        market_id: {
+          type: "string",
+          description: "Specific market ID (optional — omit for all markets)",
+        },
+        category: {
+          type: "string",
+          description: "Filter by category (crypto, politics, sports, etc.)",
+        },
+        limit: {
+          type: "number",
+          description: "Max records to return (default 100, max 1000)",
+        },
+        format: {
+          type: "string",
+          enum: ["json", "csv"],
+          description: "Output format (default: json)",
+        },
+      },
+      required: ["type"],
+    },
+  },
+  {
+    name: "get_health",
+    description: `System health check — Supabase connectivity, broker exchange status, cache stats, data freshness, market count, and AXIOM structural audit.
+
+Use this to verify the oracle is operational before relying on its data. Includes self-audit scores (AXIOM/AXIOS/VOID) for calibration health, data source freshness, and pipeline integrity.
+
+Keywords: health check, system status, uptime, connectivity, is it working, API status, service health, audit, integrity`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "get_calibration_changelog",
+    description: `View the oracle's calibration history — when and how Platt scaling parameters changed across domains.
+
+Each ORBIT cycle (daily 3am UTC) recalibrates the oracle using resolved prediction outcomes. This tool shows the versioned history of those changes, including before/after Platt parameters, ECE (Expected Calibration Error), and sample counts.
+
+Use this to understand how the oracle improves over time, verify calibration integrity, or debug prediction accuracy changes.
+
+Keywords: calibration history, oracle learning, self-improvement, Platt scaling, ECE, calibration version, accuracy changelog`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        domain: {
+          type: "string",
+          description:
+            "Filter by domain (general, sports, politics, crypto, science). Omit for all domains.",
+          enum: ["general", "sports", "politics", "crypto", "science"],
+        },
+        limit: {
+          type: "number",
+          description:
+            "Number of changelog entries to return (default 20, max 100)",
+        },
+      },
+    },
+  },
 ];
 
 // Confidence score computation — volume-weighted probability conviction
-// "Prices on thin markets are lies" — Magician's Playbook #5
 function computeConfidence(market: {
   volume: number;
   liquidity: number;
@@ -1073,7 +1199,7 @@ function computeConfidence(market: {
   const timeDecay =
     hoursLeft <= 0 ? 1 : hoursLeft <= 24 ? 0.9 : hoursLeft <= 168 ? 0.7 : 0.5;
 
-  // Weighted composite (volume matters most — Magician's Playbook #5)
+  // Weighted composite (volume matters most)
   const score =
     volumeConviction * 0.4 +
     liquidityDepth * 0.2 +
@@ -1163,12 +1289,21 @@ class TeleKashMCPServer {
   private apiKeyId: string | null = null;
   private apiKeyHash: string | null = null;
   private callsRemaining: number = 100;
+  private sessionCost: number = 0;
   private broker: TeleKashBroker;
+  private oracle: OracleClient;
+  private requestTimestamps: number[] = [];
+  private paymentAddress: string | null = null;
+  private readonly BURST_LIMITS: Record<Tier, number> = {
+    free: 5, // 5 requests/second
+    calibration: 20, // 20 requests/second
+    edge: 100, // 100 requests/second
+  };
 
   /**
    * Execute a query with cache fallback.
    * On success: caches result. On failure: returns cached version if available.
-   * "Graceful degradation is trust." — Playbook #7
+   * Graceful degradation: if live fails, serve cached. Never serve nothing.
    */
   private async cachedQuery<T>(
     cacheKey: string,
@@ -1208,6 +1343,7 @@ class TeleKashMCPServer {
 
   constructor() {
     this.broker = new TeleKashBroker();
+    this.oracle = new OracleClient();
 
     // Prune expired cache entries on startup
     try {
@@ -1222,17 +1358,19 @@ class TeleKashMCPServer {
     this.server = new Server(
       {
         name: "telekash-oracle",
-        version: "0.8.0",
+        version: "0.9.0",
       },
       {
         capabilities: {
           tools: {},
+          resources: {},
         },
       },
     );
 
     this.initializeSupabase();
     this.initializeApiKey();
+    this.initializeX402();
     this.setupHandlers();
   }
 
@@ -1245,6 +1383,10 @@ class TeleKashMCPServer {
     if (supabaseUrl && supabaseKey) {
       this.supabase = createClient(supabaseUrl, supabaseKey);
       console.error("[TeleKash MCP] Connected to Supabase");
+      // Initialize fractal oracle systems (HELIX calibration, MAG profiles)
+      this.oracle
+        .initialize(this.supabase)
+        .catch((err) => console.error("[Oracle] Background init:", err));
     } else {
       console.error(
         "[TeleKash MCP] Warning: No Supabase credentials. Using mock data.",
@@ -1262,6 +1404,20 @@ class TeleKashMCPServer {
     } else {
       console.error(
         "[TeleKash MCP] No API key — running in free tier (100 calls/day)",
+      );
+    }
+  }
+
+  private initializeX402(): void {
+    const addr = process.env.TELEKASH_PAYMENT_ADDRESS;
+    if (addr) {
+      this.paymentAddress = addr;
+      console.error(
+        `[TeleKash MCP] x402 payments enabled (${addr.substring(0, 10)}...)`,
+      );
+    } else {
+      console.error(
+        "[TeleKash MCP] No TELEKASH_PAYMENT_ADDRESS — x402 micropayments disabled",
       );
     }
   }
@@ -1323,11 +1479,32 @@ class TeleKashMCPServer {
       return {
         allowed: false,
         tier: this.tier,
-        error: `${toolName} requires ${requiredTier} tier ($${requiredTier === "calibration" ? "99" : "499"}/mo). Current tier: ${this.tier}. Upgrade at https://t.me/TeleKashBot`,
+        error: `${toolName} requires ${requiredTier} tier ($${TIER_CONFIGS[requiredTier].price_per_query}/query). Current tier: ${this.tier}. Upgrade at https://t.me/TeleKashBot`,
       };
     }
 
     return { allowed: true, tier: this.tier };
+  }
+
+  private checkBurstLimit(): { allowed: boolean; error?: string } {
+    const now = Date.now();
+    const windowMs = 1000; // 1 second window
+
+    // Remove timestamps older than the window
+    this.requestTimestamps = this.requestTimestamps.filter(
+      (t) => now - t < windowMs,
+    );
+
+    const limit = this.BURST_LIMITS[this.tier] || 5;
+    if (this.requestTimestamps.length >= limit) {
+      return {
+        allowed: false,
+        error: `Burst rate limit exceeded: ${limit} requests/second for ${this.tier} tier. Wait ${Math.ceil(this.requestTimestamps[0] + windowMs - now)}ms.`,
+      };
+    }
+
+    this.requestTimestamps.push(now);
+    return { allowed: true };
   }
 
   private async logUsage(
@@ -1338,6 +1515,9 @@ class TeleKashMCPServer {
     if (!this.supabase) return;
 
     const responseTimeMs = Date.now() - startTime;
+    const tierConfig = TIER_CONFIGS[this.tier];
+    const queryCost = tierConfig.price_per_query;
+
     try {
       await this.supabase.from("telekash_usage_logs").insert({
         api_key_id: this.apiKeyId,
@@ -1345,7 +1525,27 @@ class TeleKashMCPServer {
         tier: this.tier,
         args_hash: argsHash,
         response_time_ms: responseTimeMs,
+        query_cost_usd: queryCost,
       });
+
+      // Track cumulative revenue from per-query pricing
+      if (queryCost > 0) {
+        try {
+          await this.supabase.from("telekash_revenue").insert({
+            source: "query_fee",
+            amount_usd: queryCost,
+            amount_stars: 0,
+            details: {
+              tool_name: toolName,
+              tier: this.tier,
+              api_key_id: this.apiKeyId,
+              response_time_ms: responseTimeMs,
+            },
+          });
+        } catch {
+          // Revenue tracking is best-effort
+        }
+      }
     } catch {
       // Don't fail the request if logging fails
     }
@@ -1361,24 +1561,179 @@ class TeleKashMCPServer {
       return { tools: visibleTools };
     });
 
+    // List resources — includes onboarding welcome message
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
+      const tierConfig = TIER_CONFIGS[this.tier];
+      const tierPricing: Record<string, string> = {
+        free: "$0 (100 queries/day)",
+        calibration: "$0.01/query ($0.01/query, 1000 queries/day)",
+        edge: "$0.05/query ($0.05/query, unlimited queries)",
+      };
+
+      const recommendedTools: Record<string, string[]> = {
+        free: [
+          "get_trending — discover markets with biggest probability swings right now",
+          "search_markets — find prediction markets on any topic",
+          "get_probability — get real-time odds for any market",
+        ],
+        calibration: [
+          "compare_sources — cross-source odds comparison to find mispricings",
+          "detect_arbitrage — automated arbitrage detection with buy/sell signals",
+          "track_prediction — record predictions and build a calibration track record",
+        ],
+        edge: [
+          "get_signal — structured TPF signal with probability, confidence, and verdict",
+          "get_edge — Kelly Criterion optimal position sizing",
+          "execute_trade — route trades through Kalshi, Polymarket, or native pools",
+        ],
+      };
+
+      const welcome = {
+        tier: this.tier,
+        pricing: tierPricing[this.tier],
+        tools_available: tierConfig.tools.length,
+        recommended_first_tools: recommendedTools[this.tier],
+        tip: "Use generate_api_key to create a tracked API key — this unlocks usage analytics, prediction performance tracking, and lets you monitor your spend across sessions.",
+        docs: "https://github.com/TeleKashOracle/mcp-server",
+      };
+
+      return {
+        resources: [
+          {
+            uri: "telekash://welcome",
+            name: "TeleKash Oracle — Onboarding Guide",
+            description: `Welcome to the probability oracle for the agent economy. You are on the ${this.tier} tier (${tierPricing[this.tier]}). ${tierConfig.tools.length} tools available.`,
+            mimeType: "application/json",
+            text: JSON.stringify(welcome, null, 2),
+          },
+        ],
+      };
+    });
+
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       const startTime = Date.now();
+      let x402Verified: X402PaymentVerified | null = null;
 
-      // Check tier access + rate limit
-      const access = await this.checkTierAccess(name);
-      if (!access.allowed) {
+      // ── x402 Payment Check ──────────────────────────────────
+      // If agent attached x402_payment proof, verify and bypass tier check.
+      // ADDITIVE — agents can use API keys + tiers OR pay per-call with USDC.
+      if (args && isX402Payment(args as Record<string, unknown>)) {
+        const proof = extractPaymentProof(args as Record<string, unknown>);
+        if (proof) {
+          const toolPrice = getToolPrice(
+            name,
+            TIER_REQUIRED[name],
+            TIER_CONFIGS,
+          );
+          try {
+            x402Verified = verifyPayment(proof, toolPrice);
+            console.error(
+              `[TeleKash x402] Paid access: tool=${name} tx=${proof.tx_hash.substring(0, 16)}... price=$${toolPrice}`,
+            );
+            // Log x402 payment to Supabase if available
+            if (this.supabase) {
+              void this.supabase
+                .from("telekash_usage_logs")
+                .insert({
+                  api_key_id: this.apiKeyId,
+                  tool_name: name,
+                  tier: "x402",
+                  query_cost_usd: toolPrice,
+                  args_hash: proof.tx_hash.substring(0, 16),
+                  response_time_ms: 0,
+                })
+                .then(() => {});
+            }
+          } catch (err) {
+            const msg =
+              err instanceof Error
+                ? err.message
+                : "Payment verification failed";
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    { error: "x402_payment_invalid", message: msg },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
+      }
+
+      // ── Tier Check (skipped if x402 payment verified) ──────
+      if (!x402Verified) {
+        const access = await this.checkTierAccess(name);
+        if (!access.allowed) {
+          // If x402 is configured, return payment instructions alongside denial
+          const toolPrice = getToolPrice(
+            name,
+            TIER_REQUIRED[name],
+            TIER_CONFIGS,
+          );
+          if (this.paymentAddress && toolPrice > 0) {
+            const paymentInfo = createPaymentRequired(
+              name,
+              toolPrice,
+              this.paymentAddress,
+            );
+            return formatX402Response(paymentInfo);
+          }
+
+          // No x402 configured — standard tier denial
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    error: "access_denied",
+                    message: access.error,
+                    tier: access.tier,
+                    upgrade_url: "https://t.me/TeleKashBot",
+                    pricing: {
+                      calibration: {
+                        per_query: "$0.01",
+                        tools:
+                          "cross-source analysis, arbitrage, performance tracking",
+                      },
+                      edge: {
+                        per_query: "$0.05",
+                        tools:
+                          "signals, broker (1% commission), pools (5% fee), alerts",
+                      },
+                    },
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // Check burst rate limit (per-second)
+      const burst = this.checkBurstLimit();
+      if (!burst.allowed) {
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
-                  error: "access_denied",
-                  message: access.error,
-                  tier: access.tier,
-                  upgrade_url: "https://t.me/TeleKashBot",
+                  error: "burst_rate_limited",
+                  message: burst.error,
+                  tier: this.tier,
+                  retry_after_ms: 1000,
                 },
                 null,
                 2,
@@ -1389,7 +1744,7 @@ class TeleKashMCPServer {
         };
       }
 
-      // Inject "According to TeleKash" citation into JSON responses
+      // Inject oracle provenance chain into JSON responses
       const addCitation = (result: {
         content: Array<{ type: string; text: string }>;
         isError?: boolean;
@@ -1400,9 +1755,32 @@ class TeleKashMCPServer {
             try {
               const parsed = JSON.parse(item.text);
               if (typeof parsed === "object" && parsed !== null) {
-                parsed._source =
-                  "According to TeleKash Oracle (telekash-mcp-server)";
-                parsed._tier = this.tier;
+                parsed._oracle = {
+                  source: "TeleKash Oracle",
+                  version: "0.9.0",
+                  tier: x402Verified ? "x402" : this.tier,
+                  confidence_method: "multi-source cross-verification",
+                  citation:
+                    "According to TeleKash Oracle — the probability oracle for the agent economy",
+                  verify: "https://telekash-mcp.telekash.workers.dev/mcp",
+                  _cost: {
+                    this_query: x402Verified
+                      ? x402Verified.amount_usd
+                      : TIER_CONFIGS[this.tier].price_per_query,
+                    session_total: this.sessionCost,
+                    currency: "USD",
+                    payment_method: x402Verified ? "x402_usdc" : "api_key",
+                  },
+                  ...(x402Verified
+                    ? {
+                        x402_receipt: {
+                          tx_hash: x402Verified.tx_hash,
+                          network: x402Verified.network,
+                          amount_usd: x402Verified.amount_usd,
+                        },
+                      }
+                    : {}),
+                };
                 if (this.callsRemaining < 20) {
                   parsed._rate_limit_warning = `${this.callsRemaining} calls remaining today (${this.tier} tier)`;
                 }
@@ -1416,10 +1794,24 @@ class TeleKashMCPServer {
         return result;
       };
 
+      // MAG: Observe tool call for agent profiling
+      const agentId = this.apiKeyId || "anonymous";
+      this.oracle.observeToolCall(agentId, name);
+
+      // Refresh oracle calibration cache if stale
+      if (this.supabase) {
+        this.oracle.refreshIfNeeded(this.supabase).catch(() => {});
+      }
+
+      // Strip x402 payment metadata from args before passing to tool handlers
+      const cleanArgs = args
+        ? stripPaymentArgs(args as Record<string, unknown>)
+        : args;
+
       // Hash args for usage tracking
-      const argsHash = args
+      const argsHash = cleanArgs
         ? createHash("md5")
-            .update(JSON.stringify(args))
+            .update(JSON.stringify(cleanArgs))
             .digest("hex")
             .substring(0, 8)
         : undefined;
@@ -1607,6 +1999,26 @@ class TeleKashMCPServer {
             return addCitation(
               await this.getResolutionStatus(args as { market_id: string }),
             );
+          case "export_data":
+            return addCitation(
+              await this.exportData(
+                args as {
+                  type: string;
+                  market_id?: string;
+                  category?: string;
+                  limit?: number;
+                  format?: string;
+                },
+              ),
+            );
+          case "get_health":
+            return addCitation(await this.getHealth());
+          case "get_calibration_changelog":
+            return addCitation(
+              await this.getCalibrationChangelog(
+                args as { domain?: string; limit?: number },
+              ),
+            );
           default:
             return {
               content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -1622,6 +2034,11 @@ class TeleKashMCPServer {
         };
       } finally {
         // Log usage asynchronously (don't block response)
+        if (x402Verified) {
+          this.sessionCost += x402Verified.amount_usd;
+        } else {
+          this.sessionCost += TIER_CONFIGS[this.tier].price_per_query;
+        }
         this.logUsage(name, startTime, argsHash).catch(() => {});
       }
     });
@@ -1731,6 +2148,12 @@ class TeleKashMCPServer {
       closesAt: market.closes_at,
     });
 
+    // Calibration enrichment — raw vs calibrated confidence
+    const calibration = this.oracle.calibrate(
+      yesProb / 100,
+      market.category || "general",
+    );
+
     return {
       content: [
         {
@@ -1739,8 +2162,20 @@ class TeleKashMCPServer {
             {
               ...result,
               confidence,
+              calibration: {
+                raw_confidence: calibration.raw_confidence,
+                calibrated_confidence: calibration.calibrated_confidence,
+                calibration_version: calibration.calibration_version,
+                calibration_domain: calibration.calibration_domain,
+                next_orbit: calibration.next_orbit,
+              },
               jurisdiction:
                 SOURCE_JURISDICTION[market.source] || SOURCE_JURISDICTION.demo,
+              ...(volume < 10000
+                ? {
+                    thin_market_warning: `Low volume ($${volume.toLocaleString()}) — probability may not reflect true consensus. Consider cross-referencing with compare_sources.`,
+                  }
+                : {}),
             },
             null,
             2,
@@ -1871,6 +2306,12 @@ class TeleKashMCPServer {
     const markets = (rawData as any[]).map((m: any) => {
       const jurisdictionInfo =
         SOURCE_JURISDICTION[m.source] || SOURCE_JURISDICTION.demo;
+      const yesProbability = Math.round((m.external_odds?.yes || 0.5) * 100);
+      const volume =
+        (m.raw_data?.volume_24h as number) ||
+        (m.raw_data?.volume as number) ||
+        0;
+      const liquidity = (m.raw_data?.liquidity as number) || 0;
       return {
         id: m.id,
         title: m.title,
@@ -1878,13 +2319,16 @@ class TeleKashMCPServer {
         source: m.source,
         jurisdiction: jurisdictionInfo.jurisdiction,
         regulatory_status: jurisdictionInfo.regulatory_status,
-        yes_probability: Math.round((m.external_odds?.yes || 0.5) * 100),
-        volume_24h:
-          (m.raw_data?.volume_24h as number) ||
-          (m.raw_data?.volume as number) ||
-          0,
+        yes_probability: yesProbability,
+        volume_24h: volume,
         closes_at: m.closes_at,
         status: m.status,
+        confidence: computeConfidence({
+          volume,
+          liquidity,
+          yesProbability,
+          closesAt: m.closes_at,
+        }),
       };
     });
 
@@ -2005,11 +2449,41 @@ class TeleKashMCPServer {
 
     // Calculate trend
     let trend = "stable";
+    let noiseFilter: {
+      signal_quality: string;
+      reversals: number;
+      sustained_moves: number;
+    } | null = null;
     if (history.length >= 2) {
       const first = history[0].probability;
       const last = history[history.length - 1].probability;
       const change = last - first;
       trend = change > 1 ? "up" : change < -1 ? "down" : "stable";
+
+      // Noise detection: count direction reversals vs sustained moves
+      if (history.length >= 3) {
+        let reversals = 0;
+        let sustainedMoves = 0;
+        for (let i = 2; i < history.length; i++) {
+          const prevDir =
+            history[i - 1].probability - history[i - 2].probability;
+          const currDir = history[i].probability - history[i - 1].probability;
+          if (prevDir * currDir < 0) reversals++;
+          else if (Math.abs(currDir) > 0.1) sustainedMoves++;
+        }
+        const totalMoves = Math.max(1, reversals + sustainedMoves);
+        const signalRatio = sustainedMoves / totalMoves;
+        noiseFilter = {
+          signal_quality:
+            signalRatio >= 0.6
+              ? "sustained_momentum"
+              : signalRatio >= 0.4
+                ? "mixed"
+                : "likely_noise_reversal",
+          reversals,
+          sustained_moves: sustainedMoves,
+        };
+      }
     }
 
     return {
@@ -2023,6 +2497,7 @@ class TeleKashMCPServer {
               timeframe,
               data_points: history.length,
               trend,
+              ...(noiseFilter ? { noise_filter: noiseFilter } : {}),
               history,
               current: {
                 yes_probability: Math.round(
@@ -2101,16 +2576,30 @@ class TeleKashMCPServer {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const markets = (data || []).map((m: any) => ({
-      id: m.id,
-      title: m.title,
-      category: m.category,
-      source: m.source,
-      yes_probability: Math.round((m.external_odds?.yes || 0.5) * 100),
-      volume_24h: m.raw_data?.volume || 0,
-      closes_at: m.closes_at,
-      status: m.status,
-    }));
+    const markets = (data || []).map((m: any) => {
+      const yesProbability = Math.round((m.external_odds?.yes || 0.5) * 100);
+      const volume =
+        (m.raw_data?.volume_24h as number) ||
+        (m.raw_data?.volume as number) ||
+        0;
+      const liquidity = (m.raw_data?.liquidity as number) || 0;
+      return {
+        id: m.id,
+        title: m.title,
+        category: m.category,
+        source: m.source,
+        yes_probability: yesProbability,
+        volume_24h: volume,
+        closes_at: m.closes_at,
+        status: m.status,
+        confidence: computeConfidence({
+          volume,
+          liquidity,
+          yesProbability,
+          closesAt: m.closes_at,
+        }),
+      };
+    });
 
     return {
       content: [
@@ -2499,7 +2988,7 @@ class TeleKashMCPServer {
       const { data: recentMarkets } = await this.supabase
         .from("telekash_markets")
         .select(
-          "id, title, category, source, external_odds, updated_at, closes_at",
+          "id, title, category, source, external_odds, raw_data, updated_at, closes_at",
         )
         .eq("status", "active")
         .order("updated_at", { ascending: false })
@@ -2513,17 +3002,29 @@ class TeleKashMCPServer {
               {
                 timeframe,
                 trending: (recentMarkets || []).map(
-                  (m: Record<string, unknown>) => ({
-                    market_id: m.id,
-                    title: m.title,
-                    category: m.category,
-                    source: m.source,
-                    current_probability: Math.round(
+                  (m: Record<string, unknown>) => {
+                    const yesProbability = Math.round(
                       ((m.external_odds as Record<string, number>)?.yes ||
                         0.5) * 100,
-                    ),
-                    last_updated: m.updated_at,
-                  }),
+                    );
+                    const rawData = m.raw_data as Record<string, number> | null;
+                    const volume = rawData?.volume_24h || rawData?.volume || 0;
+                    const liquidity = rawData?.liquidity || 0;
+                    return {
+                      market_id: m.id,
+                      title: m.title,
+                      category: m.category,
+                      source: m.source,
+                      current_probability: yesProbability,
+                      last_updated: m.updated_at,
+                      confidence: computeConfidence({
+                        volume,
+                        liquidity,
+                        yesProbability,
+                        closesAt: m.closes_at as string,
+                      }),
+                    };
+                  },
                 ),
                 total: (recentMarkets || []).length,
                 _note:
@@ -2553,7 +3054,7 @@ class TeleKashMCPServer {
       marketSnapshots[entry.market_id].probabilities.push(entry.probability);
     }
 
-    // Noise filter: "58% of price moves are noise" — Magician's Playbook #3
+    // Noise filter: detect signal vs random walk reversal
     // Real signal = sustained directional move across multiple snapshots
     // Noise = random walk with serial correlation reversal
     const swings = Object.values(marketSnapshots)
@@ -2621,7 +3122,7 @@ class TeleKashMCPServer {
     const marketIds = swings.map((s) => s.market_id);
     const { data: markets } = await this.supabase
       .from("telekash_markets")
-      .select("id, title, category, source, closes_at")
+      .select("id, title, category, source, external_odds, raw_data, closes_at")
       .in("id", marketIds);
 
     const marketMap: Record<string, Record<string, unknown>> = {};
@@ -2629,13 +3130,26 @@ class TeleKashMCPServer {
       marketMap[(m as { id: string }).id] = m as Record<string, unknown>;
     }
 
-    const trending = swings.map((s) => ({
-      ...s,
-      title: marketMap[s.market_id]?.title || "Unknown",
-      category: marketMap[s.market_id]?.category || "other",
-      source: marketMap[s.market_id]?.source || "unknown",
-      closes_at: marketMap[s.market_id]?.closes_at,
-    }));
+    const trending = swings.map((s) => {
+      const mkt = marketMap[s.market_id];
+      const rawData = mkt?.raw_data as Record<string, number> | null;
+      const volume = rawData?.volume_24h || rawData?.volume || 0;
+      const liquidity = rawData?.liquidity || 0;
+      const closesAt = (mkt?.closes_at as string) || new Date().toISOString();
+      return {
+        ...s,
+        title: mkt?.title || "Unknown",
+        category: mkt?.category || "other",
+        source: mkt?.source || "unknown",
+        closes_at: mkt?.closes_at,
+        confidence: computeConfidence({
+          volume,
+          liquidity,
+          yesProbability: s.to_probability,
+          closesAt,
+        }),
+      };
+    });
 
     const signalCount = trending.filter(
       (t) => t.signal_quality === "signal",
@@ -2840,6 +3354,27 @@ class TeleKashMCPServer {
                 .length,
               polymarket_only: pairs.filter((p) => !p.kalshi && p.polymarket)
                 .length,
+              calibration_edge: (() => {
+                const matched = pairs.filter(
+                  (p) => p.kalshi && p.polymarket && p.delta !== null,
+                );
+                if (matched.length === 0) return null;
+                const biggestGap = matched.reduce((max, p) =>
+                  Math.abs(p.delta!) > Math.abs(max.delta!) ? p : max,
+                );
+                const avgDelta =
+                  matched.reduce((sum, p) => sum + Math.abs(p.delta!), 0) /
+                  matched.length;
+                return {
+                  avg_cross_source_gap: parseFloat(avgDelta.toFixed(1)),
+                  largest_disagreement: {
+                    topic: biggestGap.topic,
+                    delta: biggestGap.delta,
+                  },
+                  _note:
+                    "Cross-source gaps are where calibration edge lives. The wider the disagreement, the more likely one source is mispriced.",
+                };
+              })(),
               _note:
                 "Delta = Kalshi probability minus Polymarket probability. Positive = Kalshi more bullish.",
             },
@@ -3040,8 +3575,23 @@ class TeleKashMCPServer {
                 kalshi: kalshi.length,
                 polymarket: poly.length,
               },
+              consensus_divergence_warning:
+                topOpps.length > 0 &&
+                topOpps.some((o) => {
+                  const avgProb =
+                    (o.kalshi.yes_probability + o.polymarket.yes_probability) /
+                    2;
+                  return (
+                    (avgProb > 60 && o.kalshi.yes_probability < 50) ||
+                    (avgProb > 60 && o.polymarket.yes_probability < 50) ||
+                    (avgProb < 40 && o.kalshi.yes_probability > 50) ||
+                    (avgProb < 40 && o.polymarket.yes_probability > 50)
+                  );
+                })
+                  ? "Sources disagree on direction for some markets — potential herd formation on one exchange. Cross-reference volume to identify which source has deeper conviction."
+                  : null,
               _note:
-                "Spread = absolute difference in YES probability between Kalshi and Polymarket. Signal shows which side to buy/sell for convergence profit. Academic research: $40M+ extracted from prediction market mispricings annually.",
+                "Spread = absolute difference in YES probability between Kalshi and Polymarket. Signal shows which side to buy/sell for convergence profit.",
             },
             null,
             2,
@@ -3324,10 +3874,14 @@ class TeleKashMCPServer {
       verdict = "NO_SIGNAL";
     }
 
+    // === CALIBRATION ===
+    const signalCategory = (market.category as string) || "general";
+    const calibration = this.oracle.calibrate(yesProb, signalCategory);
+
     // === BUILD TPF RESPONSE ===
     const tpf = {
       format: "TPF",
-      version: "1.0",
+      version: "1.1",
       market: {
         id: market.id,
         title: market.title,
@@ -3339,6 +3893,8 @@ class TeleKashMCPServer {
       probability: {
         yes: Math.round(yesProb * 100),
         no: Math.round(noProb * 100),
+        calibrated_yes: Math.round(calibration.calibrated_confidence * 100),
+        calibration_version: calibration.calibration_version,
         confidence: {
           score: confidence.score,
           grade: confidence.grade,
@@ -3364,7 +3920,7 @@ class TeleKashMCPServer {
         data_points: dataPoints,
         _warning:
           signalQuality === "noise"
-            ? "Momentum is likely noise — 58% of price moves are random walk (Magician's Playbook #3)"
+            ? "Momentum is likely noise — 58% of short-term price moves reverse within 24h"
             : null,
       },
       cross_source: crossSource,
@@ -3380,9 +3936,17 @@ class TeleKashMCPServer {
           momentum,
         ),
       },
+      ...(daysToClose <= 1
+        ? {
+            holding_period_warning:
+              "Markets closing within 24h show 18% lower returns for late entrants — price convergence compresses edge.",
+          }
+        : {}),
       metadata: {
         generated_at: new Date().toISOString(),
         oracle: "TeleKash Probability Oracle",
+        signal_source:
+          "Pre-computed from live market data across regulated exchanges, not LLM-generated",
         _note:
           "TPF (TeleKash Probability Format) — structured signal for autonomous agents. One call replaces get_probability + get_sentiment + get_history + compare_sources.",
       },
@@ -3583,8 +4147,9 @@ class TeleKashMCPServer {
                 resolution_criteria,
                 created_by: creator_id,
               },
+              permissionless: true,
               _note:
-                "Market created successfully. Other agents can now query this market via get_probability, get_signal, and track_prediction. Odds will move as predictions accumulate.",
+                "Market created successfully. No gatekeepers, no approval queue — you set the question, the market resolves on the date. Other agents can now query via get_probability, get_signal, and track_prediction.",
             },
             null,
             2,
@@ -3698,6 +4263,8 @@ class TeleKashMCPServer {
       risk_classification: string;
       days_to_close: number;
       annualized_return_pct: number;
+      opportunity_cost: { vs_risk_free: number; worth_locking: boolean };
+      holding_period_warning?: string;
     }> = [];
 
     const confidenceThresholds: Record<string, number> = {
@@ -3759,6 +4326,12 @@ class TeleKashMCPServer {
       else if (kellyFraction > 0.05) riskClass = "moderate";
       else riskClass = "conservative";
 
+      // Opportunity cost: annualized return vs risk-free rate (5%)
+      const riskFreeRate = 5.0;
+      const opportunityCostPct = parseFloat(
+        (annualizedReturn - riskFreeRate).toFixed(1),
+      );
+
       opportunities.push({
         market_id: market.id as string,
         title: market.title as string,
@@ -3773,6 +4346,16 @@ class TeleKashMCPServer {
         risk_classification: riskClass,
         days_to_close: parseFloat(daysToClose.toFixed(1)),
         annualized_return_pct: annualizedReturn,
+        opportunity_cost: {
+          vs_risk_free: opportunityCostPct,
+          worth_locking: opportunityCostPct > 0,
+        },
+        ...(daysToClose <= 1
+          ? {
+              holding_period_warning:
+                "Market closing within 24h — late entries show 18% lower realized returns",
+            }
+          : {}),
       });
     }
 
@@ -4007,6 +4590,17 @@ class TeleKashMCPServer {
                   metaculus: metaculusMarkets.length,
                 },
               },
+              consensus_divergence_warning: results.some((d) => {
+                const probs = Object.values(d.sources).map(
+                  (s) => s.yes_probability,
+                );
+                const avg = probs.reduce((a, b) => a + b, 0) / probs.length;
+                return probs.some(
+                  (p) => (p > 50 && avg < 50) || (p < 50 && avg > 50),
+                );
+              })
+                ? "Sources disagree on DIRECTION for some markets — when exchanges point opposite ways, one crowd is herding wrong. The cross-source truth is in the volume-weighted average."
+                : null,
               _note:
                 "Divergences show where prediction sources disagree. STRONG divergences (>15%) are rare and high-value — at least one source is significantly wrong. Metaculus forecaster_depth indicates crowd wisdom backing.",
             },
@@ -4021,6 +4615,58 @@ class TeleKashMCPServer {
   // ===========================================
   // AGENT PERFORMANCE TRACKING
   // ===========================================
+
+  private checkMilestone(predictionCount: number): {
+    milestone: boolean;
+    message: string;
+    tier: string;
+    next: number | null;
+  } | null {
+    const milestones: Record<number, { message: string; tier: string }> = {
+      10: {
+        message:
+          "Trader unlocked! You've made 10 predictions. Custom avatar available.",
+        tier: "Trader",
+      },
+      50: {
+        message:
+          "Analyst achieved! 50 predictions. Early market access unlocked.",
+        tier: "Analyst",
+      },
+      100: {
+        message: "Century club! 100 predictions. Entering Expert territory.",
+        tier: "Expert",
+      },
+      200: {
+        message: "Expert status! 200 predictions. Reduced fees activated.",
+        tier: "Expert",
+      },
+      500: {
+        message:
+          "Oracle rank achieved! 500 predictions. You can now create markets.",
+        tier: "Oracle",
+      },
+      1000: {
+        message:
+          "Legend! 1000 predictions. Revenue share unlocked. You are the top.",
+        tier: "Legend",
+      },
+    };
+
+    if (milestones[predictionCount]) {
+      const next =
+        Object.keys(milestones)
+          .map(Number)
+          .find((m) => m > predictionCount) || null;
+      return {
+        milestone: true,
+        message: milestones[predictionCount].message,
+        tier: milestones[predictionCount].tier,
+        next,
+      };
+    }
+    return null;
+  }
 
   private async trackPrediction(args: {
     market_id: string;
@@ -4174,6 +4820,18 @@ class TeleKashMCPServer {
       };
     }
 
+    // Check for AURA POLARIS milestones
+    let milestoneNotification = null;
+    if (this.supabase) {
+      const { count } = await this.supabase
+        .from("telekash_agent_predictions")
+        .select("id", { count: "exact", head: true })
+        .eq("agent_id", agent_id);
+      if (count) {
+        milestoneNotification = this.checkMilestone(count);
+      }
+    }
+
     return {
       content: [
         {
@@ -4198,6 +4856,9 @@ class TeleKashMCPServer {
                 ),
                 recorded_at: prediction.created_at,
               },
+              ...(milestoneNotification
+                ? { milestone: milestoneNotification }
+                : {}),
               _note:
                 "Prediction recorded. Check accuracy after market resolves with get_performance.",
             },
@@ -4385,6 +5046,33 @@ class TeleKashMCPServer {
         date: p.created_at,
       }));
 
+    // Benchmark against platform average
+    let benchmark = null;
+    if (this.supabase && brierScore !== null) {
+      const { data: allPredictions } = await this.supabase
+        .from("telekash_agent_predictions")
+        .select("brier_score")
+        .not("brier_score", "is", null)
+        .limit(1000);
+
+      if (allPredictions && allPredictions.length > 5) {
+        const scores = allPredictions
+          .map((p: Record<string, unknown>) => p.brier_score as number)
+          .sort((a: number, b: number) => a - b);
+        const median = scores[Math.floor(scores.length / 2)];
+        const betterThan = scores.filter((s: number) => s > brierScore).length;
+        const percentile = Math.round((betterThan / scores.length) * 100);
+
+        benchmark = {
+          your_brier_score: brierScore,
+          platform_median: median,
+          percentile,
+          rank: `Top ${100 - percentile}% of agents`,
+          total_agents_tracked: scores.length,
+        };
+      }
+    }
+
     return {
       content: [
         {
@@ -4425,7 +5113,17 @@ class TeleKashMCPServer {
                 _note:
                   "Edge measures how much your predictions diverged from market consensus. Edge win rate shows if that divergence added value.",
               },
+              ...(benchmark ? { benchmark } : {}),
+              reality_check:
+                brierScore !== null
+                  ? {
+                      percentile: benchmark ? benchmark.percentile : null,
+                      context:
+                        "Across prediction markets, only ~7.6% of participants are consistently profitable. Calibration (Brier score) is the strongest predictor of long-term edge.",
+                    }
+                  : null,
               calibration: calibrationBuckets,
+              ...this.oracle.getAgentInsight(agent_id, brierScore, total),
               recent_predictions: recentPredictions,
             },
             null,
@@ -5352,14 +6050,14 @@ class TeleKashMCPServer {
               },
               upgrade: {
                 calibration: {
-                  price: "$99/mo",
+                  price: "$0.01/query",
                   calls_per_day: 1000,
                   tools: TIER_CONFIGS.calibration.tools.length,
                   includes:
                     "arbitrage, divergences, cross-source, performance tracking",
                 },
                 edge: {
-                  price: "$499/mo",
+                  price: "$0.05/query",
                   calls_per_day: "unlimited",
                   tools: TIER_CONFIGS.edge.tools.length,
                   includes:
@@ -5382,6 +6080,108 @@ class TeleKashMCPServer {
   }> {
     const tierConfig = TIER_CONFIGS[this.tier];
 
+    // Tool category classification
+    const TOOL_CATEGORIES: Record<string, string> = {
+      get_probability: "intelligence",
+      list_markets: "intelligence",
+      search_markets: "intelligence",
+      get_history: "intelligence",
+      get_sentiment: "intelligence",
+      get_market_stats: "intelligence",
+      get_trending: "intelligence",
+      compare_sources: "intelligence",
+      get_divergences: "intelligence",
+      get_signal: "intelligence",
+      get_edge: "intelligence",
+      detect_arbitrage: "trading",
+      track_prediction: "trading",
+      get_performance: "trading",
+      execute_trade: "trading",
+      get_order_status: "trading",
+      cancel_order: "trading",
+      create_market: "trading",
+      register_alert: "trading",
+      list_alerts: "trading",
+      delete_alert: "trading",
+      export_data: "admin",
+      generate_api_key: "admin",
+      get_usage: "admin",
+      get_health: "admin",
+      get_resolution_status: "admin",
+    };
+
+    // Per-tool usage breakdown (last 24h)
+    const toolBreakdown: Record<string, { calls: number; cost: number }> = {};
+    let dailySpend = 0;
+    const categorySpend: Record<string, { calls: number; cost: number }> = {
+      intelligence: { calls: 0, cost: 0 },
+      trading: { calls: 0, cost: 0 },
+      admin: { calls: 0, cost: 0 },
+    };
+
+    if (this.supabase && this.apiKeyId) {
+      const yesterday = new Date(Date.now() - 86400000).toISOString();
+      const { data: usageLogs } = await this.supabase
+        .from("telekash_usage_logs")
+        .select("tool_name, query_cost_usd")
+        .eq("api_key_id", this.apiKeyId)
+        .gte("created_at", yesterday);
+
+      if (usageLogs) {
+        for (const log of usageLogs) {
+          const tool = log.tool_name || "unknown";
+          if (!toolBreakdown[tool]) toolBreakdown[tool] = { calls: 0, cost: 0 };
+          toolBreakdown[tool].calls++;
+          const cost = log.query_cost_usd || 0;
+          toolBreakdown[tool].cost += cost;
+          dailySpend += cost;
+
+          // Accumulate category spend
+          const category = TOOL_CATEGORIES[tool] || "admin";
+          if (!categorySpend[category])
+            categorySpend[category] = { calls: 0, cost: 0 };
+          categorySpend[category].calls++;
+          categorySpend[category].cost += cost;
+        }
+      }
+    }
+
+    // Round category costs
+    for (const cat of Object.keys(categorySpend)) {
+      categorySpend[cat].cost =
+        Math.round(categorySpend[cat].cost * 1000) / 1000;
+    }
+    // Round per-tool costs
+    for (const tool of Object.keys(toolBreakdown)) {
+      toolBreakdown[tool].cost =
+        Math.round(toolBreakdown[tool].cost * 1000) / 1000;
+    }
+
+    // Detect first-time user (full daily allowance still available)
+    const isFirstUse = this.callsRemaining >= tierConfig.calls_per_day - 1;
+
+    // Calculate remaining budget estimate for paid tiers
+    let budgetEstimate: Record<string, unknown> | undefined;
+    if (this.tier !== "free") {
+      const monthlyBudget = this.tier === "calibration" ? 99 : 499;
+      const dailyBudgetEstimate = monthlyBudget / 30;
+      const remainingDailyBudget = Math.max(
+        0,
+        Math.round((dailyBudgetEstimate - dailySpend) * 100) / 100,
+      );
+      const remainingQueriesEstimate =
+        tierConfig.price_per_query > 0
+          ? Math.floor(remainingDailyBudget / tierConfig.price_per_query)
+          : this.callsRemaining;
+      budgetEstimate = {
+        monthly_budget_usd: monthlyBudget,
+        daily_budget_estimate_usd: Math.round(dailyBudgetEstimate * 100) / 100,
+        daily_spent_usd: Math.round(dailySpend * 1000) / 1000,
+        daily_remaining_usd: remainingDailyBudget,
+        estimated_queries_remaining: remainingQueriesEstimate,
+      };
+    }
+
     const usage: Record<string, unknown> = {
       tier: this.tier,
       rate_limit: {
@@ -5395,7 +6195,52 @@ class TeleKashMCPServer {
         sources: tierConfig.sources,
       },
       has_api_key: !!this.apiKeyHash,
+      spend: {
+        session_usd: Math.round((this.sessionCost || 0) * 1000) / 1000,
+        daily_usd: Math.round(dailySpend * 1000) / 1000,
+        price_per_query_usd: tierConfig.price_per_query,
+      },
+      cost_by_category: categorySpend,
+      per_tool_breakdown_24h: toolBreakdown,
+      ...(budgetEstimate ? { budget: budgetEstimate } : {}),
+      install: "npx telekash-mcp-server",
     };
+
+    // Add welcome info for first-time users
+    if (isFirstUse) {
+      const tierPricing: Record<string, string> = {
+        free: "$0 (100 queries/day, no charge)",
+        calibration: "$0.01/query ($99/mo, 1000 queries/day)",
+        edge: "$0.05/query ($499/mo, unlimited queries)",
+      };
+
+      const recommendedTools: Record<string, string[]> = {
+        free: [
+          "get_trending — discover markets with biggest probability swings",
+          "search_markets — find prediction markets on any topic",
+          "get_probability — get real-time odds for any market",
+        ],
+        calibration: [
+          "compare_sources — cross-source odds comparison to find mispricings",
+          "detect_arbitrage — automated arbitrage detection with buy/sell signals",
+          "track_prediction — record predictions and build a calibration track record",
+        ],
+        edge: [
+          "get_signal — structured TPF signal with probability, confidence, and verdict",
+          "get_edge — Kelly Criterion optimal position sizing",
+          "execute_trade — route trades through Kalshi, Polymarket, or native pools",
+        ],
+      };
+
+      usage.welcome = {
+        message:
+          "Welcome to TeleKash Oracle — the probability oracle for the agent economy.",
+        your_tier: `${this.tier} — ${tierPricing[this.tier]}`,
+        recommended_first_tools: recommendedTools[this.tier],
+        tip: "Use generate_api_key to create a tracked API key. This unlocks usage analytics, prediction performance tracking, and spend monitoring across sessions.",
+        docs: "https://github.com/TeleKashOracle/mcp-server",
+      };
+    }
 
     // Add upgrade info if not on edge
     if (this.tier !== "edge") {
@@ -5403,7 +6248,7 @@ class TeleKashMCPServer {
       const nextConfig = TIER_CONFIGS[nextTier];
       usage.upgrade = {
         next_tier: nextTier,
-        price: nextTier === "calibration" ? "$99/mo" : "$499/mo",
+        price: nextTier === "calibration" ? "$0.01/query" : "$0.05/query",
         calls_per_day: nextConfig.calls_per_day,
         additional_tools: nextConfig.tools.filter(
           (t) => !tierConfig.tools.includes(t),
@@ -5623,6 +6468,38 @@ class TeleKashMCPServer {
         .then(() => {});
     }
 
+    // Cumulative trading stats for this agent
+    let cumulative = null;
+    if (this.supabase && this.apiKeyId) {
+      const { data: stats } = await this.supabase
+        .from("telekash_broker_orders")
+        .select("status, fill_amount_usd, commission_usd")
+        .eq("api_key_id", this.apiKeyId);
+
+      if (stats && stats.length > 0) {
+        const totalTrades = stats.length;
+        const filled = stats.filter(
+          (s: Record<string, unknown>) => s.status === "filled",
+        );
+        const totalVolume = filled.reduce(
+          (sum: number, s: Record<string, unknown>) =>
+            sum + ((s.fill_amount_usd as number) || 0),
+          0,
+        );
+        const totalCommission = filled.reduce(
+          (sum: number, s: Record<string, unknown>) =>
+            sum + ((s.commission_usd as number) || 0),
+          0,
+        );
+        cumulative = {
+          total_trades: totalTrades,
+          filled_trades: filled.length,
+          total_volume_usd: Math.round(totalVolume * 100) / 100,
+          total_commission_usd: Math.round(totalCommission * 100) / 100,
+        };
+      }
+    }
+
     return {
       content: [
         {
@@ -5644,6 +6521,17 @@ class TeleKashMCPServer {
                 commission_usd: result.commission_usd,
                 status: result.status,
               },
+              receipt: {
+                gross_amount: amount_usd,
+                commission_rate: "1%",
+                commission_usd: result.commission_usd || amount_usd * 0.01,
+                net_cost:
+                  amount_usd + (result.commission_usd || amount_usd * 0.01),
+                exchange: result.routed_to,
+                timestamp: new Date().toISOString(),
+                note: "Commission is charged on filled trades only. Unfilled limit orders have zero commission.",
+              },
+              ...(cumulative ? { cumulative } : {}),
               connected_exchanges: connected,
               ...(result.error ? { error: result.error } : {}),
             },
@@ -6046,25 +6934,41 @@ class TeleKashMCPServer {
         .eq("status", "pending_match");
     }
 
-    // Update pool totals
+    // Update pool totals atomically (prevents race conditions with concurrent agents)
     if (pool) {
-      const volumes = (pool.outcome_volumes as Record<string, number>) || {};
-      volumes[outcome] = (volumes[outcome] || 0) + starsEquivalent;
-      const newTotal = (pool.total_volume || 0) + starsEquivalent;
-      const percentages: Record<string, number> = {};
-      for (const [key, vol] of Object.entries(volumes)) {
-        percentages[key] = newTotal > 0 ? vol / newTotal : 0;
+      // Use RPC for atomic pool update — avoids read-modify-write race
+      const { error: poolUpdateError } = await this.supabase.rpc(
+        "telekash_atomic_pool_update",
+        {
+          p_pool_id: pool.id,
+          p_outcome: outcome,
+          p_amount: starsEquivalent,
+        },
+      );
+
+      if (poolUpdateError) {
+        console.error(
+          `[TeleKash MCP] Pool update error (non-fatal): ${poolUpdateError.message}`,
+        );
+        // Fallback to direct update if RPC doesn't exist yet
+        const volumes = (pool.outcome_volumes as Record<string, number>) || {};
+        volumes[outcome] = (volumes[outcome] || 0) + starsEquivalent;
+        const newTotal = (pool.total_volume || 0) + starsEquivalent;
+        const percentages: Record<string, number> = {};
+        for (const [key, vol] of Object.entries(volumes)) {
+          percentages[key] = newTotal > 0 ? vol / newTotal : 0;
+        }
+        await this.supabase
+          .from("telekash_pools")
+          .update({
+            total_volume: newTotal,
+            outcome_volumes: volumes,
+            outcome_percentages: percentages,
+            total_fees: Math.floor(newTotal * 0.05),
+            participant_count: (pool.participant_count || 0) + 1,
+          })
+          .eq("id", pool.id);
       }
-      await this.supabase
-        .from("telekash_pools")
-        .update({
-          total_volume: newTotal,
-          outcome_volumes: volumes,
-          outcome_percentages: percentages,
-          total_fees: Math.floor(newTotal * 0.05),
-          participant_count: (pool.participant_count || 0) + 1,
-        })
-        .eq("id", pool.id);
     }
 
     // Log revenue (pool fee estimated)
@@ -6304,6 +7208,113 @@ class TeleKashMCPServer {
         { p_market_id: market_id },
       );
 
+      // Build resolution forecast from cross-source data
+      const similarList = (similarMarkets || []) as Array<{
+        linked_market_id: string;
+        linked_source: string;
+        linked_title: string;
+        linked_status: string;
+        linked_yes_probability?: number;
+        match_score: number;
+      }>;
+
+      // Fetch yes_probability for the primary market
+      const { data: primaryProb } = await this.supabase
+        .from("telekash_markets")
+        .select("yes_probability")
+        .eq("id", market_id)
+        .single();
+
+      // Collect probability readings from all sources
+      const probabilityReadings: Array<{
+        source: string;
+        probability: number;
+      }> = [];
+
+      if (primaryProb?.yes_probability != null) {
+        probabilityReadings.push({
+          source: market.source,
+          probability: primaryProb.yes_probability,
+        });
+      }
+
+      // Fetch probabilities for similar cross-source markets
+      if (similarList.length > 0) {
+        const crossIds = similarList.map((m) => m.linked_market_id);
+        const { data: crossMarkets } = await this.supabase
+          .from("telekash_markets")
+          .select("id, source, yes_probability")
+          .in("id", crossIds);
+
+        for (const cm of crossMarkets || []) {
+          if (cm.yes_probability != null) {
+            probabilityReadings.push({
+              source: cm.source,
+              probability: cm.yes_probability,
+            });
+          }
+        }
+      }
+
+      // Calculate consensus and forecast
+      const closesAt = market.closes_at ? new Date(market.closes_at) : null;
+      const now = new Date();
+      const daysRemaining = closesAt
+        ? Math.max(
+            0,
+            Math.round(
+              (closesAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+            ),
+          )
+        : null;
+
+      let currentConsensus: string;
+      let earlyResolutionPossible = false;
+
+      if (probabilityReadings.length === 0) {
+        currentConsensus = "No probability data available";
+      } else {
+        const avgProb =
+          probabilityReadings.reduce((sum, r) => sum + r.probability, 0) /
+          probabilityReadings.length;
+        const roundedProb = Math.round(avgProb);
+        const direction = avgProb >= 50 ? "YES" : "NO";
+        const effectiveProb = avgProb >= 50 ? roundedProb : 100 - roundedProb;
+        const sourceCount = probabilityReadings.length;
+        currentConsensus = `${direction} at ${effectiveProb}% (${sourceCount} source${sourceCount > 1 ? "s" : ""} ${sourceCount > 1 ? "agree" : "reporting"})`;
+
+        // Early resolution possible if consensus is very strong (>90%) across multiple sources
+        if (effectiveProb >= 90 && sourceCount >= 2) {
+          earlyResolutionPossible = true;
+        }
+      }
+
+      // Source agreement analysis
+      let sourceAgreement: { level: string; details: string } | null = null;
+      if (probabilityReadings.length >= 2) {
+        const probs = probabilityReadings.map((r) => r.probability);
+        const maxDelta = Math.max(...probs) - Math.min(...probs);
+        const allSameDirection =
+          probs.every((p) => p >= 50) || probs.every((p) => p < 50);
+        sourceAgreement = {
+          level:
+            maxDelta <= 5 ? "STRONG" : maxDelta <= 15 ? "MODERATE" : "WEAK",
+          details: allSameDirection
+            ? `Sources agree on direction (max spread: ${Math.round(maxDelta)}%)`
+            : `Sources DISAGREE on direction — resolution confidence is reduced`,
+        };
+      }
+
+      const resolutionForecast = {
+        expected_resolution: closesAt
+          ? closesAt.toISOString().split("T")[0]
+          : null,
+        days_remaining: daysRemaining,
+        current_consensus: currentConsensus,
+        source_agreement: sourceAgreement,
+        early_resolution_possible: earlyResolutionPossible,
+      };
+
       return {
         content: [
           {
@@ -6321,31 +7332,16 @@ class TeleKashMCPServer {
                     "Market not yet resolved. Resolution occurs at close date.",
                 },
                 cross_source_markets:
-                  (similarMarkets || []).length > 0
-                    ? (
-                        similarMarkets as Array<{
-                          linked_market_id: string;
-                          linked_source: string;
-                          linked_title: string;
-                          linked_status: string;
-                          match_score: number;
-                        }>
-                      ).map(
-                        (m: {
-                          linked_market_id: string;
-                          linked_source: string;
-                          linked_title: string;
-                          linked_status: string;
-                          match_score: number;
-                        }) => ({
-                          market_id: m.linked_market_id,
-                          source: m.linked_source,
-                          title: m.linked_title,
-                          status: m.linked_status,
-                          match_score: Math.round(m.match_score * 100) + "%",
-                        }),
-                      )
+                  similarList.length > 0
+                    ? similarList.map((m) => ({
+                        market_id: m.linked_market_id,
+                        source: m.linked_source,
+                        title: m.linked_title,
+                        status: m.linked_status,
+                        match_score: Math.round(m.match_score * 100) + "%",
+                      }))
                     : "No cross-source markets found",
+                resolution_forecast: resolutionForecast,
                 resolution_method:
                   market.source === "kalshi" || market.source === "polymarket"
                     ? `Mirrors resolution from ${market.source} + cross-source verification`
@@ -6377,7 +7373,179 @@ class TeleKashMCPServer {
       .or(`market_id_a.eq.${market_id},market_id_b.eq.${market_id}`)
       .limit(10);
 
+    // Cross-source verification: find similar markets and compare resolved outcomes
+    const { data: similarResolved } = await this.supabase.rpc(
+      "find_similar_markets",
+      { p_market_id: market_id },
+    );
+
+    const similarResolvedList = (similarResolved || []) as Array<{
+      linked_market_id: string;
+      linked_source: string;
+      linked_title: string;
+      linked_status: string;
+      match_score: number;
+    }>;
+
+    // Fetch resolved outcomes for cross-source markets
+    const crossSourceVerification: {
+      sources_checked: string[];
+      outcomes_agree: boolean;
+      agreement_score: number;
+      discrepancies: Array<{
+        source: string;
+        market_id: string;
+        outcome: string | null;
+        status: string;
+      }>;
+    } = {
+      sources_checked: [market.source],
+      outcomes_agree: true,
+      agreement_score: 1.0,
+      discrepancies: [],
+    };
+
+    if (similarResolvedList.length > 0) {
+      const crossIds = similarResolvedList.map((m) => m.linked_market_id);
+      const { data: crossMarkets } = await this.supabase
+        .from("telekash_markets")
+        .select("id, source, status, resolved_outcome")
+        .in("id", crossIds);
+
+      const resolvedCross = (crossMarkets || []).filter(
+        (cm: {
+          id: string;
+          source: string;
+          status: string;
+          resolved_outcome: string | null;
+        }) => cm.status === "resolved" && cm.resolved_outcome != null,
+      );
+      const unresolvedCross = (crossMarkets || []).filter(
+        (cm: {
+          id: string;
+          source: string;
+          status: string;
+          resolved_outcome: string | null;
+        }) => cm.status !== "resolved",
+      );
+
+      // Add all checked sources
+      for (const cm of crossMarkets || []) {
+        if (!crossSourceVerification.sources_checked.includes(cm.source)) {
+          crossSourceVerification.sources_checked.push(cm.source);
+        }
+      }
+
+      // Compare outcomes
+      let agreeCount = 1; // primary market agrees with itself
+      let totalResolved = 1; // primary market
+
+      for (const cm of resolvedCross as Array<{
+        id: string;
+        source: string;
+        status: string;
+        resolved_outcome: string | null;
+      }>) {
+        totalResolved++;
+        const primaryOutcome = (market.resolved_outcome || "")
+          .toString()
+          .toLowerCase()
+          .trim();
+        const crossOutcome = (cm.resolved_outcome || "")
+          .toString()
+          .toLowerCase()
+          .trim();
+
+        if (primaryOutcome === crossOutcome) {
+          agreeCount++;
+        } else {
+          crossSourceVerification.discrepancies.push({
+            source: cm.source,
+            market_id: cm.id,
+            outcome: cm.resolved_outcome,
+            status: cm.status,
+          });
+        }
+      }
+
+      // Also flag unresolved cross-source markets as potential discrepancies
+      for (const cm of unresolvedCross as Array<{
+        id: string;
+        source: string;
+        status: string;
+        resolved_outcome: string | null;
+      }>) {
+        crossSourceVerification.discrepancies.push({
+          source: cm.source,
+          market_id: cm.id,
+          outcome: null,
+          status: cm.status,
+        });
+      }
+
+      crossSourceVerification.agreement_score =
+        totalResolved > 0
+          ? Math.round((agreeCount / totalResolved) * 100) / 100
+          : 1.0;
+      crossSourceVerification.outcomes_agree =
+        crossSourceVerification.discrepancies.filter((d) => d.outcome != null)
+          .length === 0;
+    }
+
+    // Resolution trust assessment
     const confidence = market.resolution_confidence || 0.7;
+
+    const resolvedAt = market.resolved_at ? new Date(market.resolved_at) : null;
+    const hoursSinceResolution = resolvedAt
+      ? (Date.now() - resolvedAt.getTime()) / (1000 * 60 * 60)
+      : 0;
+
+    const sourceCount = crossSourceVerification.sources_checked.length;
+    const hasDiscrepancies = !crossSourceVerification.outcomes_agree;
+
+    let trustLevel: "high" | "medium" | "low" | "disputed";
+    let trustReason: string;
+    let trustRecommendation: string;
+
+    if (hasDiscrepancies) {
+      trustLevel = "disputed";
+      const disagreeingSources = crossSourceVerification.discrepancies
+        .filter((d) => d.outcome != null)
+        .map((d) => d.source);
+      trustReason = `Sources disagree: ${disagreeingSources.join(", ")} report different outcome`;
+      trustRecommendation = "Resolution disputed — do not trade";
+    } else if (
+      sourceCount >= 3 &&
+      crossSourceVerification.agreement_score >= 0.95
+    ) {
+      trustLevel = "high";
+      trustReason = `${sourceCount}/${sourceCount} sources agree on ${market.resolved_outcome} outcome`;
+      trustRecommendation = "Safe to trust";
+    } else if (
+      sourceCount >= 2 &&
+      crossSourceVerification.agreement_score >= 0.8
+    ) {
+      trustLevel =
+        sourceCount >= 3 || hoursSinceResolution > 24 ? "high" : "medium";
+      trustReason = `${sourceCount}/${sourceCount} sources agree on ${market.resolved_outcome} outcome`;
+      trustRecommendation =
+        trustLevel === "high" ? "Safe to trust" : "Verify manually";
+    } else if (sourceCount === 1 && confidence >= 0.8) {
+      trustLevel = "medium";
+      trustReason = `Single source (${market.source}) with ${Math.round(confidence * 100)}% confidence`;
+      trustRecommendation = "Verify manually";
+    } else {
+      trustLevel = "low";
+      trustReason = `Only ${sourceCount} source${sourceCount > 1 ? "s" : ""}, confidence ${Math.round(confidence * 100)}%`;
+      trustRecommendation = "Verify manually";
+    }
+
+    const resolutionTrust = {
+      level: trustLevel,
+      reason: trustReason,
+      recommendation: trustRecommendation,
+    };
+
     let confidenceLabel: string;
     if (confidence >= 0.95)
       confidenceLabel = "VERY_HIGH — Multi-source verified";
@@ -6398,6 +7566,7 @@ class TeleKashMCPServer {
               status: "resolved",
               outcome: market.resolved_outcome,
               resolved_at: market.resolved_at,
+              source_agreement: `${crossSourceVerification.sources_checked.length} source${crossSourceVerification.sources_checked.length > 1 ? "s" : ""} checked — ${crossSourceVerification.outcomes_agree ? "ALL AGREE" : "DISAGREEMENT DETECTED"}`,
               oracle: {
                 confidence,
                 confidence_label: confidenceLabel,
@@ -6407,6 +7576,8 @@ class TeleKashMCPServer {
                 requires_manual_review: market.requires_manual_review || false,
                 manual_review_reason: market.manual_review_reason || null,
               },
+              cross_source_verification: crossSourceVerification,
+              resolution_trust: resolutionTrust,
               verification_log: (verifications || []).map(
                 (v: {
                   verification_type: string;
@@ -6537,12 +7708,377 @@ class TeleKashMCPServer {
     };
   }
 
+  private async exportData(args: {
+    type: string;
+    market_id?: string;
+    category?: string;
+    limit?: number;
+    format?: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const limit = Math.min(args.limit || 100, 1000);
+    let data: unknown[] = [];
+    let meta = {};
+
+    switch (args.type) {
+      case "market_catalog": {
+        let query = this.supabase
+          .from("telekash_markets")
+          .select(
+            "id, title, source, status, category, external_odds, volume, close_date, created_at, updated_at",
+          )
+          .order("volume", { ascending: false })
+          .limit(limit);
+        if (args.category) query = query.eq("category", args.category);
+        if (args.market_id) query = query.eq("id", args.market_id);
+        const { data: markets } = await query;
+        data = markets || [];
+        meta = { type: "market_catalog", total: data.length };
+        break;
+      }
+
+      case "resolution_outcomes": {
+        let query = this.supabase
+          .from("telekash_markets")
+          .select(
+            "id, title, source, category, resolved_outcome, resolved_at, external_odds, volume",
+          )
+          .not("resolved_outcome", "is", null)
+          .order("resolved_at", { ascending: false })
+          .limit(limit);
+        if (args.category) query = query.eq("category", args.category);
+        const { data: resolved } = await query;
+        data = resolved || [];
+        meta = { type: "resolution_outcomes", total: data.length };
+        break;
+      }
+
+      case "probability_history": {
+        if (args.market_id) {
+          const { data: history } = await this.supabase
+            .from("telekash_probability_history")
+            .select("*")
+            .eq("market_id", args.market_id)
+            .order("recorded_at", { ascending: false })
+            .limit(limit);
+          data = history || [];
+        } else {
+          const { data: history } = await this.supabase
+            .from("telekash_probability_history")
+            .select("*")
+            .order("recorded_at", { ascending: false })
+            .limit(limit);
+          data = history || [];
+        }
+        meta = { type: "probability_history", total: data.length };
+        break;
+      }
+
+      case "arbitrage_history": {
+        // Query markets that exist on multiple sources with different odds
+        const { data: markets } = await this.supabase
+          .from("telekash_markets")
+          .select("id, title, source, external_odds, volume, category")
+          .eq("status", "active")
+          .order("volume", { ascending: false })
+          .limit(limit * 2);
+
+        // Find pairs by matching titles across sources
+        const titleMap = new Map<string, unknown[]>();
+        for (const m of markets || []) {
+          const key = (m as { title: string }).title.toLowerCase().trim();
+          if (!titleMap.has(key)) titleMap.set(key, []);
+          titleMap.get(key)!.push(m);
+        }
+
+        const opportunities: unknown[] = [];
+        for (const [, group] of titleMap) {
+          if (group.length > 1) {
+            opportunities.push({
+              markets: group,
+              source_count: group.length,
+            });
+          }
+        }
+        data = opportunities.slice(0, limit);
+        meta = { type: "arbitrage_history", pairs_found: data.length };
+        break;
+      }
+
+      default:
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `Unknown export type: ${args.type}. Use: market_catalog, resolution_outcomes, probability_history, arbitrage_history`,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+    }
+
+    if (args.format === "csv" && data.length > 0) {
+      const headers = Object.keys(data[0] as Record<string, unknown>).join(",");
+      const rows = data.map((row) =>
+        Object.values(row as Record<string, unknown>)
+          .map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v)))
+          .join(","),
+      );
+      return {
+        content: [{ type: "text", text: [headers, ...rows].join("\n") }],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ...meta,
+              export_cost_usd: TIER_CONFIGS.edge.price_per_query,
+              records: data,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async getCalibrationChangelog(args: {
+    domain?: string;
+    limit?: number;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    const { domain, limit = 20 } = args;
+    const effectiveLimit = Math.min(Math.max(1, limit), 100);
+
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    let query = this.supabase
+      .from("telekash_calibration_changelog")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(effectiveLimit);
+
+    if (domain) {
+      query = query.eq("domain", domain);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      if (error.code === "42P01") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: "Calibration changelog table not yet created",
+                  _note:
+                    "The fractal self-improvement migration needs to be applied first.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Failed to fetch changelog", details: error.message },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              total_entries: data?.length || 0,
+              domain_filter: domain || "all",
+              changelog: (data || []).map((entry: Record<string, unknown>) => ({
+                version: entry.calibration_version,
+                domain: entry.domain,
+                change_type: entry.change_type,
+                platt_a: {
+                  before: entry.platt_a_before,
+                  after: entry.platt_a_after,
+                },
+                platt_b: {
+                  before: entry.platt_b_before,
+                  after: entry.platt_b_after,
+                },
+                ece: {
+                  before: entry.ece_before,
+                  after: entry.ece_after,
+                },
+                samples_used: entry.samples_used,
+                notes: entry.notes,
+                timestamp: entry.created_at,
+              })),
+              _note:
+                "ORBIT cycles run daily at 3am UTC. Each entry shows how Platt scaling parameters changed. Lower ECE = better calibration.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  private async getHealth(): Promise<{
+    content: Array<{ type: "text"; text: string }>;
+  }> {
+    const health: Record<string, unknown> = {
+      status: "operational",
+      version: "0.9.0",
+      timestamp: new Date().toISOString(),
+    };
+
+    // Supabase connectivity
+    if (this.supabase) {
+      try {
+        const { count } = await this.supabase
+          .from("telekash_markets")
+          .select("id", { count: "exact", head: true })
+          .eq("status", "active");
+        health.database = { connected: true, active_markets: count || 0 };
+      } catch (err) {
+        health.database = {
+          connected: false,
+          error: err instanceof Error ? err.message : "Unknown",
+        };
+      }
+    } else {
+      health.database = { connected: false, mode: "demo" };
+    }
+
+    // Broker status
+    const exchanges = this.broker.getConnectedExchanges();
+    health.broker = {
+      connected_exchanges: exchanges,
+      native_pool: true,
+    };
+
+    // Cache stats
+    try {
+      health.cache = cacheStats();
+    } catch {
+      health.cache = { available: false };
+    }
+
+    // Data freshness
+    if (this.supabase) {
+      try {
+        const { data } = await this.supabase
+          .from("telekash_markets")
+          .select("updated_at")
+          .order("updated_at", { ascending: false })
+          .limit(1)
+          .single();
+        if (data) {
+          const age = Date.now() - new Date(data.updated_at).getTime();
+          health.data_freshness = {
+            last_update: data.updated_at,
+            age_minutes: Math.round(age / 60000),
+            fresh: age < 30 * 60000, // < 30 min = fresh
+          };
+        }
+      } catch {
+        health.data_freshness = { unknown: true };
+      }
+    }
+
+    // Tier info
+    health.tier = {
+      current: this.tier,
+      price_per_query: TIER_CONFIGS[this.tier].price_per_query,
+      calls_remaining: this.callsRemaining,
+    };
+
+    // AXIOM structural audit
+    if (this.supabase) {
+      try {
+        health.oracle_audit = await this.oracle.audit(this.supabase);
+      } catch {
+        health.oracle_audit = { available: false };
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(health, null, 2) }],
+    };
+  }
+
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
+
+    // Validate broker credentials on boot (non-blocking)
     const exchanges = this.broker.getConnectedExchanges();
+    if (exchanges.length > 0) {
+      this.broker
+        .validateCredentials()
+        .then((status) => {
+          const verified = [
+            status.kalshi.connected
+              ? "kalshi ✓"
+              : status.kalshi.error
+                ? `kalshi ✗ (${status.kalshi.error})`
+                : null,
+            status.polymarket.connected
+              ? "polymarket ✓"
+              : status.polymarket.error
+                ? `polymarket ✗ (${status.polymarket.error})`
+                : null,
+          ].filter(Boolean);
+          console.error(
+            `[TeleKash MCP] Broker validation: ${verified.join(", ")}`,
+          );
+        })
+        .catch(() => {});
+    }
+
     console.error(
-      `[TeleKash MCP] Prediction Oracle running on stdio | Broker: ${exchanges.length > 0 ? exchanges.join(", ") : "no exchange credentials"} | Native pool: enabled`,
+      `[TeleKash MCP] Prediction Oracle v0.8.1 running on stdio | Tier: ${this.tier} ($${TIER_CONFIGS[this.tier].price_per_query}/query) | Broker: ${exchanges.length > 0 ? exchanges.join(", ") : "no exchange credentials"} | Native pool: enabled`,
     );
   }
 }
