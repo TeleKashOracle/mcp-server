@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (25 live):
+ * Oracle Tools (26 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -192,6 +192,7 @@ const TIER_REQUIRED: Record<string, Tier> = {
   cancel_order: "edge",
   get_pool_status: "edge",
   get_agent_balance: "edge",
+  get_resolution_status: "calibration",
 };
 
 // Types
@@ -997,6 +998,32 @@ Fund your balance via Stripe (through the TeleKash dashboard) to trade in native
       properties: {},
     },
   },
+  {
+    name: "get_resolution_status",
+    description: `Check resolution status and confidence for a market.
+
+Shows multi-source verification results: which sources confirmed the outcome,
+confidence level, and whether manual review is needed.
+
+Resolution confidence levels:
+- 0.99: Price-based (CoinGecko) — objective, verifiable
+- 0.95: Multi-source agreement (2+ sources confirm same outcome)
+- 0.825: Cross-verified by 1 additional source
+- 0.70: Single source only (no cross-verification available)
+- 0.30: Sources DISAGREE — flagged for manual review
+
+Use this to verify resolution integrity before accepting payout results.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        market_id: {
+          type: "string",
+          description: "Market ID to check resolution status",
+        },
+      },
+      required: ["market_id"],
+    },
+  },
 ];
 
 // Confidence score computation — volume-weighted probability conviction
@@ -1515,6 +1542,10 @@ class TeleKashMCPServer {
             );
           case "get_agent_balance":
             return addCitation(await this.getAgentBalance());
+          case "get_resolution_status":
+            return addCitation(
+              await this.getResolutionStatus(args as { market_id: string }),
+            );
           default:
             return {
               content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -6144,6 +6175,187 @@ class TeleKashMCPServer {
   /**
    * Get agent's pool balance and performance stats
    */
+  // ===== RESOLUTION ORACLE =====
+
+  private async getResolutionStatus(args: {
+    market_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "No database connection" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const { market_id } = args;
+
+    // Fetch the market with resolution data
+    const { data: market, error: marketError } = await this.supabase
+      .from("telekash_markets")
+      .select(
+        "id, title, source, status, resolved_outcome, resolved_at, resolution_confidence, resolution_sources, resolution_data, requires_manual_review, manual_review_reason, closes_at",
+      )
+      .eq("id", market_id)
+      .single();
+
+    if (marketError || !market) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: `Market not found: ${market_id}` },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // If not resolved yet, show pre-resolution status
+    if (market.status !== "resolved") {
+      // Check for similar markets across sources
+      const { data: similarMarkets } = await this.supabase.rpc(
+        "find_similar_markets",
+        { p_market_id: market_id },
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                market_id: market.id,
+                title: market.title,
+                status: market.status,
+                source: market.source,
+                closes_at: market.closes_at,
+                resolution: {
+                  status: "pending",
+                  message:
+                    "Market not yet resolved. Resolution occurs at close date.",
+                },
+                cross_source_markets:
+                  (similarMarkets || []).length > 0
+                    ? (
+                        similarMarkets as Array<{
+                          linked_market_id: string;
+                          linked_source: string;
+                          linked_title: string;
+                          linked_status: string;
+                          match_score: number;
+                        }>
+                      ).map(
+                        (m: {
+                          linked_market_id: string;
+                          linked_source: string;
+                          linked_title: string;
+                          linked_status: string;
+                          match_score: number;
+                        }) => ({
+                          market_id: m.linked_market_id,
+                          source: m.linked_source,
+                          title: m.linked_title,
+                          status: m.linked_status,
+                          match_score: Math.round(m.match_score * 100) + "%",
+                        }),
+                      )
+                    : "No cross-source markets found",
+                resolution_method:
+                  market.source === "kalshi" || market.source === "polymarket"
+                    ? `Mirrors resolution from ${market.source} + cross-source verification`
+                    : market.source === "agent"
+                      ? "Creator-resolved or multi-source oracle"
+                      : "CoinGecko price oracle (0.99 confidence)",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Market is resolved — show full verification details
+    // Fetch verification log
+    const { data: verifications } = await this.supabase
+      .from("telekash_resolution_verifications")
+      .select("*")
+      .eq("market_id", market_id)
+      .order("verified_at", { ascending: false })
+      .limit(5);
+
+    // Fetch linked markets
+    const { data: links } = await this.supabase
+      .from("telekash_market_links")
+      .select("*")
+      .or(`market_id_a.eq.${market_id},market_id_b.eq.${market_id}`)
+      .limit(10);
+
+    const confidence = market.resolution_confidence || 0.7;
+    let confidenceLabel: string;
+    if (confidence >= 0.95)
+      confidenceLabel = "VERY_HIGH — Multi-source verified";
+    else if (confidence >= 0.8)
+      confidenceLabel = "HIGH — Cross-source confirmed";
+    else if (confidence >= 0.7) confidenceLabel = "STANDARD — Single source";
+    else if (confidence >= 0.3) confidenceLabel = "LOW — Sources disagree";
+    else confidenceLabel = "UNVERIFIED";
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              market_id: market.id,
+              title: market.title,
+              status: "resolved",
+              outcome: market.resolved_outcome,
+              resolved_at: market.resolved_at,
+              oracle: {
+                confidence,
+                confidence_label: confidenceLabel,
+                sources: market.resolution_sources || [
+                  { source: market.source, type: "primary" },
+                ],
+                requires_manual_review: market.requires_manual_review || false,
+                manual_review_reason: market.manual_review_reason || null,
+              },
+              verification_log: (verifications || []).map(
+                (v: {
+                  verification_type: string;
+                  sources_checked: unknown;
+                  sources_agree: boolean | null;
+                  final_confidence: number;
+                  verified_at: string;
+                  notes: string | null;
+                }) => ({
+                  type: v.verification_type,
+                  sources_checked: v.sources_checked,
+                  sources_agree: v.sources_agree,
+                  confidence: v.final_confidence,
+                  verified_at: v.verified_at,
+                  notes: v.notes,
+                }),
+              ),
+              cross_source_links: (links || []).length,
+              resolution_data: market.resolution_data,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   private async getAgentBalance(): Promise<{
     content: Array<{ type: "text"; text: string }>;
   }> {

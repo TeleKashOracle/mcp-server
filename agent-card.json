@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/google/A2A/main/specification/json/a2a.schema.json",
   "name": "TeleKash Prediction Oracle",
-  "description": "Probability oracle + trade broker for the agent economy. 25 tools across 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Smart trade routing with 1% commission OR dual-sided native pools (trade alongside Telegram users). Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
+  "description": "Probability oracle + trade broker for the agent economy. 26 tools across 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Multi-source resolution oracle with cross-source verification (0.70-0.99 confidence). Smart trade routing with 1% commission OR dual-sided native pools (trade alongside Telegram users). Structured TPF signals, cross-source arbitrage detection, noise filtering, Kelly Criterion sizing, agent performance tracking with Brier scores, and webhook alerts.",
   "url": "https://github.com/TeleKashOracle/mcp-server",
   "version": "0.8.0",
   "capabilities": {
