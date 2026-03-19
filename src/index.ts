@@ -52,6 +52,15 @@ import {
   type BrokerResult,
   type NativePoolResult,
 } from "./broker.js";
+import {
+  cacheGet,
+  cacheSet,
+  cachePrune,
+  cacheStats,
+  cacheEnforceSize,
+  cacheClose,
+  type CacheEntry,
+} from "./cache.js";
 
 // ============================================
 // TIER SYSTEM — Free / Calibration ($99/mo) / Edge ($499/mo)
@@ -1156,8 +1165,60 @@ class TeleKashMCPServer {
   private callsRemaining: number = 100;
   private broker: TeleKashBroker;
 
+  /**
+   * Execute a query with cache fallback.
+   * On success: caches result. On failure: returns cached version if available.
+   * "Graceful degradation is trust." — Playbook #7
+   */
+  private async cachedQuery<T>(
+    cacheKey: string,
+    category:
+      | "markets"
+      | "market_detail"
+      | "probabilities"
+      | "trending"
+      | "stats"
+      | "default",
+    queryFn: () => Promise<T>,
+  ): Promise<{ data: T; fromCache: boolean; freshness?: string }> {
+    try {
+      // Try live query
+      const result = await queryFn();
+      // Cache the successful result
+      cacheSet(cacheKey, result, category);
+      return { data: result, fromCache: false };
+    } catch (err) {
+      // Live query failed — try cache
+      console.error(`[TeleKash MCP] Query failed, checking cache: ${cacheKey}`);
+      const cached = cacheGet<T>(cacheKey, true); // allowStale = true
+      if (cached) {
+        console.error(
+          `[TeleKash MCP] Serving from cache (age: ${Math.round(cached.age_seconds / 60)}min)`,
+        );
+        return {
+          data: cached.data,
+          fromCache: true,
+          freshness: cached.freshness,
+        };
+      }
+      // No cache either — re-throw
+      throw err;
+    }
+  }
+
   constructor() {
     this.broker = new TeleKashBroker();
+
+    // Prune expired cache entries on startup
+    try {
+      const pruned = cachePrune();
+      cacheEnforceSize();
+      if (pruned > 0)
+        console.error(`[TeleKash MCP] Pruned ${pruned} expired cache entries`);
+    } catch {
+      // Cache init failure is non-fatal
+    }
+
     this.server = new Server(
       {
         name: "telekash-oracle",
@@ -1794,14 +1855,20 @@ class TeleKashMCPServer {
         });
     }
 
-    const { data, error } = await query;
+    const cacheKey = `list:${category}:${sort_by}:${effectiveLimit}:${effectiveSource}`;
 
-    if (error) {
-      throw new Error(`Database error: ${error.message}`);
-    }
+    const {
+      data: rawData,
+      fromCache,
+      freshness,
+    } = await this.cachedQuery(cacheKey, "markets", async () => {
+      const { data, error } = await query;
+      if (error) throw new Error(`Database error: ${error.message}`);
+      return data || [];
+    });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const markets = (data || []).map((m: any) => {
+    const markets = (rawData as any[]).map((m: any) => {
       const jurisdictionInfo =
         SOURCE_JURISDICTION[m.source] || SOURCE_JURISDICTION.demo;
       return {
@@ -1821,24 +1888,29 @@ class TeleKashMCPServer {
       };
     });
 
+    const result: Record<string, unknown> = {
+      markets,
+      total: markets.length,
+      filters: {
+        category,
+        sort_by,
+        source: effectiveSource,
+        jurisdiction,
+      },
+    };
+
+    if (fromCache) {
+      result._cache = {
+        freshness,
+        note: "Live data temporarily unavailable. Serving cached results.",
+      };
+    }
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              markets,
-              total: markets.length,
-              filters: {
-                category,
-                sort_by,
-                source: effectiveSource,
-                jurisdiction,
-              },
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(result, null, 2),
         },
       ],
     };
@@ -2320,16 +2392,18 @@ class TeleKashMCPServer {
       };
     }
 
-    // Get all markets for counting
-    const { data, error } = await this.supabase
-      .from("telekash_markets")
-      .select("id, status, category, source");
-
-    if (error) {
-      throw new Error(`Stats error: ${error.message}`);
-    }
-
-    const markets = data || [];
+    // Get all markets for counting (cached)
+    const {
+      data: markets,
+      fromCache,
+      freshness,
+    } = await this.cachedQuery("stats:all_markets", "stats", async () => {
+      const { data, error } = await this.supabase!.from(
+        "telekash_markets",
+      ).select("id, status, category, source");
+      if (error) throw new Error(`Stats error: ${error.message}`);
+      return data || [];
+    });
 
     const stats = {
       total_markets: markets.length,
@@ -2350,19 +2424,24 @@ class TeleKashMCPServer {
       bySource[source] = (bySource[source] || 0) + 1;
     }
 
+    const result: Record<string, unknown> = {
+      summary: stats,
+      by_category: byCategory,
+      by_source: bySource,
+    };
+
+    if (fromCache) {
+      result._cache = {
+        freshness,
+        note: "Live data temporarily unavailable. Serving cached stats.",
+      };
+    }
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              summary: stats,
-              by_category: byCategory,
-              by_source: bySource,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(result, null, 2),
         },
       ],
     };
