@@ -4,6 +4,8 @@ The probability oracle for the agent economy. 13 tools across 500+ live markets 
 
 > "Chainlink is the price oracle. TeleKash is the probability oracle."
 
+[![telekash-mcp-server MCP server](https://glama.ai/mcp/servers/TeleKashOracle/mcp-server/badges/card.svg)](https://glama.ai/mcp/servers/TeleKashOracle/mcp-server)
+
 ## Installation
 
 ```bash
