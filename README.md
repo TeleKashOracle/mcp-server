@@ -9,7 +9,14 @@
 
 ## What is this?
 
-TeleKash is a probability oracle that gives AI agents real-time access to 500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. It provides structured trading signals, cross-source arbitrage detection, noise filtering, and broker execution across crypto, politics, sports, entertainment, finance, weather, tech, and science categories. One MCP server replaces polling multiple exchanges.
+TeleKash is the probability oracle for the agent economy. Real-time access to 4,500+ live prediction markets from Kalshi (CFTC-regulated) and Polymarket. Structured trading signals, cross-source arbitrage detection, noise filtering, and smart trade routing across crypto, politics, sports, entertainment, finance, weather, tech, and science.
+
+**What makes it different:**
+
+- **Multi-source** — Kalshi + Polymarket + native pools, not single-exchange
+- **Self-calibrating** — Platt scaling with daily recalibration cycles and Brier score tracking
+- **Universal Payment Layer** — agents pay per-call with USDC (Base/Polygon/Solana via x402), fiat (Stripe), or TON
+- **28 tools** — from free probabilities to broker execution with 1% commission
 
 ## Quick Install
 
@@ -40,7 +47,7 @@ Add to your MCP configuration file:
 
 ## Tools
 
-28 tools across 4 categories. All tools work without an API key on the Free tier (100 queries/day).
+28 tools across 4 categories. All tools work without an API key on the Free tier (100 queries/day). 4,500+ live markets.
 
 ### Intelligence
 
@@ -48,7 +55,7 @@ Add to your MCP configuration file:
 | ------------------ | ------------------------------------------------------------------ | ----------- |
 | `get_probability`  | Real-time YES/NO probability with volume-weighted confidence score | Free        |
 | `list_markets`     | Browse markets by category, source, jurisdiction, with sorting     | Free        |
-| `search_markets`   | Full-text search across 500+ markets                               | Free        |
+| `search_markets`   | Full-text search across 4,500+ markets                             | Free        |
 | `get_history`      | Historical probability changes over 1h, 24h, 7d, 30d               | Free        |
 | `get_sentiment`    | AI sentiment analysis with conviction, momentum, and noise filter  | Free        |
 | `get_market_stats` | Aggregate statistics across all markets and sources                | Free        |
@@ -108,6 +115,31 @@ Per-query pricing. No subscriptions. Free tier requires no API key.
 | Broker trades        | 1% commission        | Best-price execution routed to Kalshi or Polymarket |
 | Native pool trades   | 5% fee at resolution | Parimutuel pools alongside Telegram users           |
 
+### Universal Payment Layer
+
+Agents can also pay per-call without an API key or tier — attach payment proof directly in tool arguments.
+
+| Rail                | Network               | Asset             | Fee       |
+| ------------------- | --------------------- | ----------------- | --------- |
+| **x402** (Coinbase) | Base, Polygon, Solana | USDC              | Free (0%) |
+| **Stripe MPP**      | Fiat                  | USD (cards, bank) | 2.9%      |
+| **TON**             | TON mainnet           | TON               | Free (0%) |
+
+```typescript
+// Agent pays per-call — no subscription needed
+const result = await client.callTool({
+  name: "get_signal",
+  arguments: {
+    query: "Bitcoin 200K",
+    x402_payment: {
+      tx_hash: "0xabc...",
+      network: "base",
+      rail: "x402",
+    },
+  },
+});
+```
+
 ### Get an API key
 
 ```bash
@@ -159,7 +191,10 @@ The server works without any credentials (returns demo data). For live market ac
 SUPABASE_URL=https://rrkjtdnxkscukexbsrue.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
 TELEKASH_API_KEY=your-api-key              # Optional: enables paid tiers
-TELEKASH_PAYMENT_ADDRESS=0x...             # Optional: enables x402 USDC micropayments
+TELEKASH_PAYMENT_ADDRESS=0x...             # Optional: EVM wallet for x402 USDC payments
+TELEKASH_TON_ADDRESS=UQ...                 # Optional: TON wallet for TON payments
+STRIPE_SECRET_KEY=sk_...                   # Optional: Stripe for fiat payments
+X402_FACILITATOR_URL=https://x402.org/facilitator  # Default: Coinbase facilitator
 ```
 
 ## Data Sources
