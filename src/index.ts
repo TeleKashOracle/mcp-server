@@ -7,7 +7,7 @@
  *
  * "Chainlink is the price oracle. TeleKash is the probability oracle."
  *
- * Oracle Tools (23 live):
+ * Oracle Tools (25 live):
  * - get_probability: Real-time probability for any prediction market
  * - list_markets: Browse markets by category with filtering/sorting
  * - search_markets: Full-text search across all markets
@@ -50,6 +50,7 @@ import {
   TeleKashBroker,
   type BrokerOrder,
   type BrokerResult,
+  type NativePoolResult,
 } from "./broker.js";
 
 // ============================================
@@ -189,6 +190,8 @@ const TIER_REQUIRED: Record<string, Tier> = {
   execute_trade: "edge",
   get_order_status: "edge",
   cancel_order: "edge",
+  get_pool_status: "edge",
+  get_agent_balance: "edge",
 };
 
 // Types
@@ -880,14 +883,15 @@ Event-driven, not polling — your agent sleeps until we wake it up.`,
     description: `Execute a prediction market trade through TeleKash Broker.
 
 Routes your order to the best exchange (Kalshi or Polymarket) based on where the market trades.
-TeleKash handles authentication, order routing, and settlement. You just specify what to trade.
+Or route to native_pool to join TeleKash parimutuel pools — trade alongside Telegram users.
 
-Commission: 1% of trade amount.
-Requires: Edge tier API key + exchange credentials configured on the server.
+Commission: 1% for exchange trades, 5% pool fee for native pools (deducted at resolution).
+Requires: Edge tier API key. Exchange credentials for Kalshi/Polymarket routing. Native pool requires funded agent balance.
 
-Returns: order_id, exchange_order_id, fill_price, commission, routing details.
+Native pool benefits: Your USD converts to Stars-equivalent, joining the SAME pool as Telegram mini app users.
+More participants = deeper liquidity = better odds for everyone. Payout at resolution.
 
-Example: Buy $50 of YES on "Bitcoin above $100K by December" → routes to Polymarket CLOB, fills at 0.62, commission $0.50.`,
+Returns: order_id, fill_price, commission, routing details. For native_pool: position_id, pool_composition.`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -918,9 +922,9 @@ Example: Buy $50 of YES on "Bitcoin above $100K by December" → routes to Polym
         },
         routing_preference: {
           type: "string",
-          enum: ["kalshi", "polymarket", "best_price"],
+          enum: ["kalshi", "polymarket", "best_price", "native_pool"],
           description:
-            "Where to route: 'kalshi', 'polymarket', or 'best_price' (default). best_price routes to the source where this market trades.",
+            "Where to route: 'kalshi', 'polymarket', 'best_price' (default — routes to source exchange), or 'native_pool' (join TeleKash parimutuel pool alongside Telegram users). Native pool requires funded agent balance.",
         },
       },
       required: ["market_id", "side", "amount_usd"],
@@ -958,6 +962,39 @@ Sends cancellation to the exchange and updates the order status.`,
         },
       },
       required: ["order_id"],
+    },
+  },
+  {
+    name: "get_pool_status",
+    description: `Get the current status of a TeleKash native parimutuel pool.
+
+Shows pool composition (YES/NO volume), participant counts (humans vs agents),
+current implied odds, and whether the pool is one-sided or two-sided.
+
+Use this before joining a pool via execute_trade with routing_preference='native_pool'
+to understand the current pool dynamics.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        market_id: {
+          type: "string",
+          description: "TeleKash market UUID",
+        },
+      },
+      required: ["market_id"],
+    },
+  },
+  {
+    name: "get_agent_balance",
+    description: `Check your agent's pool balance and performance stats.
+
+Shows: current USD balance, total deposited, total won/lost, pool position count, win rate.
+Balance is credited from pool resolution payouts and depleted by native pool entries.
+
+Fund your balance via Stripe (through the TeleKash dashboard) to trade in native pools.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
     },
   },
 ];
@@ -1456,7 +1493,11 @@ class TeleKashMCPServer {
                   amount_usd: number;
                   order_type?: "market" | "limit";
                   limit_price?: number;
-                  routing_preference?: "kalshi" | "polymarket" | "best_price";
+                  routing_preference?:
+                    | "kalshi"
+                    | "polymarket"
+                    | "best_price"
+                    | "native_pool";
                 },
               ),
             );
@@ -1468,6 +1509,12 @@ class TeleKashMCPServer {
             return addCitation(
               await this.brokerCancelOrder(args as { order_id: string }),
             );
+          case "get_pool_status":
+            return addCitation(
+              await this.getMarketPoolStatus(args as { market_id: string }),
+            );
+          case "get_agent_balance":
+            return addCitation(await this.getAgentBalance());
           default:
             return {
               content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -5275,7 +5322,7 @@ class TeleKashMCPServer {
     amount_usd: number;
     order_type?: "market" | "limit";
     limit_price?: number;
-    routing_preference?: "kalshi" | "polymarket" | "best_price";
+    routing_preference?: "kalshi" | "polymarket" | "best_price" | "native_pool";
   }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
     if (!this.supabase) {
       return {
@@ -5326,27 +5373,6 @@ class TeleKashMCPServer {
       };
     }
 
-    // Check connected exchanges
-    const connected = this.broker.getConnectedExchanges();
-    if (connected.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                error: "No exchange credentials configured",
-                help: "The server operator needs to set KALSHI_API_KEY + KALSHI_PRIVATE_KEY or POLY_API_KEY + POLY_API_SECRET + POLY_API_PASSPHRASE",
-                connected_exchanges: [],
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    }
-
     // Look up market
     const { data: market, error: marketError } = await this.supabase
       .from("telekash_markets")
@@ -5376,6 +5402,47 @@ class TeleKashMCPServer {
       };
     }
 
+    // ==========================================
+    // NATIVE POOL ROUTING — Dual-sided liquidity
+    // Agent trades go into the SAME pool as Telegram users
+    // ==========================================
+    if (args.routing_preference === "native_pool") {
+      return await this.executeNativePoolTrade(market, args);
+    }
+
+    // Check if we should auto-route to native pool (no exchange creds)
+    const connected = this.broker.getConnectedExchanges();
+    const { data: existingPool } = await this.supabase
+      .from("telekash_pools")
+      .select("id, total_volume")
+      .eq("market_id", market.id)
+      .limit(1)
+      .single();
+
+    if (
+      connected.length === 0 &&
+      this.broker.shouldRouteToNativePool(
+        {
+          id: market.id,
+          external_id: market.external_id,
+          source: market.source,
+          title: market.title,
+          external_odds: market.external_odds,
+          status: market.status,
+        },
+        {
+          agent_id: this.apiKeyId || "anonymous",
+          market_id,
+          side,
+          amount_usd,
+          order_type,
+        },
+        !!existingPool,
+      )
+    ) {
+      return await this.executeNativePoolTrade(market, args);
+    }
+
     // Build broker order
     const brokerOrder: BrokerOrder = {
       agent_id: this.apiKeyId || "anonymous",
@@ -5387,7 +5454,7 @@ class TeleKashMCPServer {
       routing_preference: args.routing_preference,
     };
 
-    // Route and execute
+    // Route and execute on external exchange
     const result: BrokerResult = await this.broker.routeOrder(brokerOrder, {
       id: market.id,
       external_id: market.external_id,
@@ -5671,12 +5738,520 @@ class TeleKashMCPServer {
     };
   }
 
+  // ===========================================
+  // NATIVE POOL — Dual-sided human+agent liquidity
+  // ===========================================
+
+  /**
+   * Execute a trade into a TeleKash native parimutuel pool.
+   * Agent's USD is converted to Stars-equivalent and placed alongside Telegram users.
+   * At resolution, payout is converted back to USD and credited to agent balance.
+   */
+  private async executeNativePoolTrade(
+    market: Record<string, unknown>,
+    args: {
+      market_id: string;
+      side: "yes" | "no";
+      amount_usd: number;
+      order_type?: string;
+      limit_price?: number;
+    },
+  ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const { side, amount_usd } = args;
+    const outcome = side === "yes" ? "Yes" : "No";
+
+    // Get Stars/USD conversion rate
+    const { data: configRow } = await this.supabase
+      .from("telekash_config")
+      .select("value")
+      .eq("key", "stars_usd_rate")
+      .single();
+    const starsUsdRate = configRow ? parseFloat(configRow.value) : 0.02;
+    const starsEquivalent = Math.floor(amount_usd / starsUsdRate);
+
+    if (starsEquivalent < 10) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: `Minimum pool entry is 10 Stars (${10 * starsUsdRate} USD). Your amount converts to ${starsEquivalent} Stars.`,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Deduct from agent balance
+    const { data: deductResult } = await this.supabase.rpc(
+      "deduct_agent_pool_entry",
+      {
+        p_api_key_id: this.apiKeyId,
+        p_agent_id: this.apiKeyId || "anonymous",
+        p_amount_usd: amount_usd,
+        p_stars_usd_rate: starsUsdRate,
+      },
+    );
+
+    if (!deductResult?.success) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Insufficient agent balance",
+                balance_usd: deductResult?.balance_usd || 0,
+                required_usd: amount_usd,
+                help: "Fund your agent balance via the TeleKash dashboard or Stripe.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Calculate indicative price from external odds
+    let indicativePrice = 0.5;
+    try {
+      const odds = market.external_odds as {
+        yes?: number;
+        no?: number;
+      } | null;
+      if (odds) {
+        indicativePrice =
+          outcome === "Yes" ? (odds.yes || 50) / 100 : (odds.no || 50) / 100;
+      }
+    } catch {
+      indicativePrice = 0.5;
+    }
+
+    const potentialPayout =
+      indicativePrice > 0
+        ? starsEquivalent / indicativePrice
+        : starsEquivalent * 2;
+
+    // Check for existing pool
+    const { data: pool } = await this.supabase
+      .from("telekash_pools")
+      .select("id, total_volume, outcome_volumes, participant_count")
+      .eq("market_id", market.id)
+      .limit(1)
+      .single();
+
+    // Check for opposite-side positions (pending_match escrow)
+    const oppositeOutcome = outcome === "Yes" ? "No" : "Yes";
+    const { data: oppositePositions } = await this.supabase
+      .from("telekash_positions")
+      .select("id")
+      .eq("market_id", market.id as string)
+      .eq("outcome", oppositeOutcome)
+      .in("status", ["active", "pending_match"])
+      .limit(1);
+
+    const poolIsMatched = oppositePositions && oppositePositions.length > 0;
+    const positionStatus = poolIsMatched ? "active" : "pending_match";
+    const positionId = crypto.randomUUID();
+
+    // Insert agent position into the SAME pool as Telegram users
+    const { error: positionError } = await this.supabase
+      .from("telekash_positions")
+      .insert({
+        id: positionId,
+        market_id: market.id,
+        pool_id: pool?.id || null,
+        outcome,
+        amount: starsEquivalent,
+        odds_at_entry: indicativePrice,
+        price: indicativePrice,
+        potential_payout: Math.floor(potentialPayout),
+        status: positionStatus,
+        is_agent: true,
+        agent_id: this.apiKeyId || "anonymous",
+        api_key_id: this.apiKeyId,
+        currency: "stars",
+        currency_amount: amount_usd,
+        usd_equivalent: amount_usd,
+        exchange_rate: starsUsdRate,
+        created_at: new Date().toISOString(),
+      });
+
+    if (positionError) {
+      // Refund the deducted balance
+      await this.supabase.rpc("credit_agent_pool_payout", {
+        p_api_key_id: this.apiKeyId,
+        p_payout_stars: 0,
+        p_bet_stars: 0,
+        p_won: false,
+        p_stars_usd_rate: starsUsdRate,
+      });
+      // Re-add the deducted amount
+      await this.supabase
+        .from("telekash_agent_balances")
+        .update({
+          balance_usd: deductResult.remaining_balance + amount_usd,
+        })
+        .eq("api_key_id", this.apiKeyId);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Failed to create pool position",
+                details: positionError.message,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // If this made the pool two-sided, activate all pending_match positions
+    if (poolIsMatched) {
+      await this.supabase
+        .from("telekash_positions")
+        .update({ status: "active" })
+        .eq("market_id", market.id as string)
+        .eq("status", "pending_match");
+    }
+
+    // Update pool totals
+    if (pool) {
+      const volumes = (pool.outcome_volumes as Record<string, number>) || {};
+      volumes[outcome] = (volumes[outcome] || 0) + starsEquivalent;
+      const newTotal = (pool.total_volume || 0) + starsEquivalent;
+      const percentages: Record<string, number> = {};
+      for (const [key, vol] of Object.entries(volumes)) {
+        percentages[key] = newTotal > 0 ? vol / newTotal : 0;
+      }
+      await this.supabase
+        .from("telekash_pools")
+        .update({
+          total_volume: newTotal,
+          outcome_volumes: volumes,
+          outcome_percentages: percentages,
+          total_fees: Math.floor(newTotal * 0.05),
+          participant_count: (pool.participant_count || 0) + 1,
+        })
+        .eq("id", pool.id);
+    }
+
+    // Log revenue (pool fee estimated)
+    await this.supabase.from("telekash_revenue").insert({
+      source: "pool_fee",
+      amount_usd: amount_usd * 0.05,
+      amount_stars: starsEquivalent * 0.05,
+      details: {
+        position_id: positionId,
+        market_id: market.id,
+        agent_id: this.apiKeyId,
+        is_agent: true,
+        model: "parimutuel_dual_sided",
+        usd_amount: amount_usd,
+        stars_equivalent: starsEquivalent,
+        exchange_rate: starsUsdRate,
+      },
+    });
+
+    // Get pool composition for response
+    const yesVolume =
+      ((pool?.outcome_volumes as Record<string, number>)?.Yes || 0) +
+      (outcome === "Yes" ? starsEquivalent : 0);
+    const noVolume =
+      ((pool?.outcome_volumes as Record<string, number>)?.No || 0) +
+      (outcome === "No" ? starsEquivalent : 0);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              success: true,
+              routed_to: "native_pool",
+              routing_reason: "dual_sided_liquidity",
+              position: {
+                id: positionId,
+                market_title: market.title,
+                side,
+                outcome,
+                amount_usd,
+                stars_equivalent: starsEquivalent,
+                exchange_rate: starsUsdRate,
+                effective_price: indicativePrice,
+                potential_payout_stars: Math.floor(potentialPayout),
+                potential_payout_usd:
+                  Math.floor(potentialPayout) * starsUsdRate,
+                status: positionStatus,
+              },
+              pool: {
+                yes_volume: yesVolume,
+                no_volume: noVolume,
+                total_volume: (pool?.total_volume || 0) + starsEquivalent,
+                is_two_sided: poolIsMatched || false,
+                participants: (pool?.participant_count || 0) + 1,
+                fee_rate: "5% at resolution",
+              },
+              balance: {
+                remaining_usd: deductResult.remaining_balance,
+              },
+              note: "Your position is in the SAME pool as Telegram mini app users. Payout at market resolution. 5% pool fee deducted from winnings.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Get the status of a TeleKash native parimutuel pool
+   */
+  private async getMarketPoolStatus(args: {
+    market_id: string;
+  }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    // Get market info
+    const { data: market } = await this.supabase
+      .from("telekash_markets")
+      .select("id, title, status, external_odds, close_date")
+      .or(`id.eq.${args.market_id},external_id.eq.${args.market_id}`)
+      .limit(1)
+      .single();
+
+    if (!market) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Market not found", market_id: args.market_id },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Get pool
+    const { data: pool } = await this.supabase
+      .from("telekash_pools")
+      .select("*")
+      .eq("market_id", market.id)
+      .limit(1)
+      .single();
+
+    // Count human vs agent positions
+    const { data: positions } = await this.supabase
+      .from("telekash_positions")
+      .select("id, outcome, amount, is_agent, status")
+      .eq("market_id", market.id)
+      .in("status", ["active", "pending_match"]);
+
+    const humanPositions = (positions || []).filter((p) => !p.is_agent);
+    const agentPositions = (positions || []).filter((p) => p.is_agent);
+
+    const volumes = (pool?.outcome_volumes as Record<string, number>) || {};
+    const totalVolume = pool?.total_volume || 0;
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              market: {
+                id: market.id,
+                title: market.title,
+                status: market.status,
+                closes_at: market.close_date,
+              },
+              pool: pool
+                ? {
+                    id: pool.id,
+                    status: pool.status,
+                    total_volume_stars: totalVolume,
+                    yes_volume: volumes.Yes || 0,
+                    no_volume: volumes.No || 0,
+                    implied_yes_odds:
+                      totalVolume > 0
+                        ? ((volumes.Yes || 0) / totalVolume).toFixed(3)
+                        : "0.500",
+                    implied_no_odds:
+                      totalVolume > 0
+                        ? ((volumes.No || 0) / totalVolume).toFixed(3)
+                        : "0.500",
+                    fee_rate: "5%",
+                    is_two_sided:
+                      (volumes.Yes || 0) > 0 && (volumes.No || 0) > 0,
+                  }
+                : { exists: false, note: "No pool yet. Be the first!" },
+              participants: {
+                total: (positions || []).length,
+                humans: humanPositions.length,
+                agents: agentPositions.length,
+                human_volume: humanPositions.reduce(
+                  (sum, p) => sum + (p.amount || 0),
+                  0,
+                ),
+                agent_volume: agentPositions.reduce(
+                  (sum, p) => sum + (p.amount || 0),
+                  0,
+                ),
+              },
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Get agent's pool balance and performance stats
+   */
+  private async getAgentBalance(): Promise<{
+    content: Array<{ type: "text"; text: string }>;
+  }> {
+    if (!this.supabase) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Database not configured" }, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (!this.apiKeyId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "API key required to check balance" },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Get balance
+    const { data: balance } = await this.supabase
+      .from("telekash_agent_balances")
+      .select("*")
+      .eq("api_key_id", this.apiKeyId)
+      .single();
+
+    // Get active positions
+    const { data: activePositions } = await this.supabase
+      .from("telekash_positions")
+      .select("id, market_id, outcome, amount, status, created_at")
+      .eq("api_key_id", this.apiKeyId)
+      .eq("is_agent", true)
+      .in("status", ["active", "pending_match"]);
+
+    // Get conversion rate
+    const { data: configRow } = await this.supabase
+      .from("telekash_config")
+      .select("value")
+      .eq("key", "stars_usd_rate")
+      .single();
+    const starsUsdRate = configRow ? parseFloat(configRow.value) : 0.02;
+
+    const winRate =
+      balance && balance.total_pool_positions > 0
+        ? (
+            (balance.total_pool_wins / balance.total_pool_positions) *
+            100
+          ).toFixed(1)
+        : "0.0";
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              balance: {
+                available_usd: balance?.balance_usd || 0,
+                total_deposited_usd: balance?.total_deposited_usd || 0,
+                total_won_usd: balance?.total_won_usd || 0,
+                total_lost_usd: balance?.total_lost_usd || 0,
+                net_pnl:
+                  (balance?.total_won_usd || 0) -
+                  (balance?.total_lost_usd || 0),
+              },
+              performance: {
+                total_pool_positions: balance?.total_pool_positions || 0,
+                total_pool_wins: balance?.total_pool_wins || 0,
+                win_rate_pct: winRate,
+              },
+              active_positions: (activePositions || []).map((p) => ({
+                position_id: p.id,
+                market_id: p.market_id,
+                outcome: p.outcome,
+                amount_stars: p.amount,
+                amount_usd: (p.amount || 0) * starsUsdRate,
+                status: p.status,
+                created_at: p.created_at,
+              })),
+              conversion_rate: {
+                stars_per_usd: 1 / starsUsdRate,
+                usd_per_star: starsUsdRate,
+              },
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     const exchanges = this.broker.getConnectedExchanges();
     console.error(
-      `[TeleKash MCP] Prediction Oracle running on stdio | Broker: ${exchanges.length > 0 ? exchanges.join(", ") : "no exchange credentials"}`,
+      `[TeleKash MCP] Prediction Oracle running on stdio | Broker: ${exchanges.length > 0 ? exchanges.join(", ") : "no exchange credentials"} | Native pool: enabled`,
     );
   }
 }

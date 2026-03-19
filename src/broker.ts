@@ -25,7 +25,7 @@ export interface BrokerOrder {
   amount_usd: number;
   order_type: "market" | "limit";
   limit_price?: number; // 0-1 probability (e.g. 0.65 = 65 cents)
-  routing_preference?: "kalshi" | "polymarket" | "best_price";
+  routing_preference?: "kalshi" | "polymarket" | "best_price" | "native_pool";
 }
 
 export interface BrokerResult {
@@ -440,6 +440,22 @@ class PolymarketClient {
 // SMART ROUTER
 // ============================================
 
+export interface NativePoolResult {
+  position_id: string;
+  stars_amount: number;
+  usd_amount: number;
+  exchange_rate: number;
+  effective_price: number;
+  potential_payout: number;
+  status: string;
+  pool_composition: {
+    yes_count: number;
+    no_count: number;
+    total_volume: number;
+    is_two_sided: boolean;
+  };
+}
+
 export class TeleKashBroker {
   private kalshi: KalshiClient | null = null;
   private polymarket: PolymarketClient | null = null;
@@ -756,6 +772,34 @@ export class TeleKashBroker {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  /**
+   * Check if a market should route to native TeleKash pool instead of external exchange.
+   *
+   * Native pool routing happens when:
+   * 1. Market has an active pool with existing positions (human liquidity)
+   * 2. Agent explicitly requests native pool routing
+   * 3. No external exchange credentials available (fallback)
+   *
+   * This creates dual-sided liquidity: human Stars + agent USD in the SAME pool.
+   */
+  shouldRouteToNativePool(
+    market: MarketInfo,
+    order: BrokerOrder,
+    hasNativePool: boolean,
+  ): boolean {
+    // Agent explicitly chose native pool
+    if (order.routing_preference === ("native_pool" as string)) {
+      return true;
+    }
+
+    // If no external exchanges connected, native pool is the only option
+    if (this.getConnectedExchanges().length === 0 && hasNativePool) {
+      return true;
+    }
+
+    return false;
   }
 }
 
